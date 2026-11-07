@@ -1,3 +1,8 @@
+import { AddPricedSnapshots1700000000015 } from '../src/database/migrations/1700000000015-AddPricedSnapshots';
+import { DeliveryFinancialSnapshot } from '../src/modules/finance/entities/delivery-financial-snapshot.entity';
+import { AddImmutableLedger1700000000014 } from '../src/database/migrations/1700000000014-AddImmutableLedger';
+import { LedgerEntry } from '../src/modules/finance/entities/ledger-entry.entity';
+import { LedgerEvent } from '../src/modules/finance/entities/ledger-event.entity';
 import { globSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -19,6 +24,8 @@ import { CreateIdempotencyTable1700000000008 } from '../src/database/migrations/
 import { CreateAuditTable1700000000009 } from '../src/database/migrations/1700000000009-CreateAuditTable';
 import { AddDeliveryPricingProvenance1700000000010 } from '../src/database/migrations/1700000000010-AddDeliveryPricingProvenance';
 import { EnforceUniqueAdminRoleAssignments1700000000011 } from '../src/database/migrations/1700000000011-EnforceUniqueAdminRoleAssignments';
+import { AddDriverCapabilityLifecycle1700000000012 } from '../src/database/migrations/1700000000012-AddDriverCapabilityLifecycle';
+import { AddDriverCompensationPlans1700000000013 } from '../src/database/migrations/1700000000013-AddDriverCompensationPlans';
 import { Address } from '../src/modules/addresses/entities/address.entity';
 import { AuditLog } from '../src/modules/audit/entities/audit-log.entity';
 import { IdempotencyKey } from '../src/modules/idempotency/entities/idempotency-key.entity';
@@ -31,6 +38,8 @@ import { Recipient } from '../src/modules/deliveries/entities/recipient.entity';
 import { PricingRule } from '../src/modules/pricing/entities/pricing-rule.entity';
 import { Region } from '../src/modules/regions/entities/region.entity';
 import { AdminRoleAssignment } from '../src/modules/users/entities/admin-role-assignment.entity';
+import { DriverCompensationPlan } from '../src/modules/finance/entities/driver-compensation-plan.entity';
+import { DriverPlanAssignment } from '../src/modules/finance/entities/driver-plan-assignment.entity';
 import { DriverProfile } from '../src/modules/users/entities/driver-profile.entity';
 import { RefreshToken } from '../src/modules/users/entities/refresh-token.entity';
 import { User, UserStatus } from '../src/modules/users/entities/user.entity';
@@ -40,6 +49,11 @@ import { createPostgisDatabase } from './helpers/postgis-database';
 const entities = [
   User,
   DriverProfile,
+  DriverCompensationPlan,
+  DriverPlanAssignment,
+  LedgerEntry,
+  LedgerEvent,
+  DeliveryFinancialSnapshot,
   AdminRoleAssignment,
   RefreshToken,
   Business,
@@ -69,6 +83,10 @@ const migrations = [
   CreateAuditTable1700000000009,
   AddDeliveryPricingProvenance1700000000010,
   EnforceUniqueAdminRoleAssignments1700000000011,
+  AddDriverCapabilityLifecycle1700000000012,
+  AddDriverCompensationPlans1700000000013,
+  AddImmutableLedger1700000000014,
+  AddPricedSnapshots1700000000015,
 ];
 
 describe('Entity relationships against the migrated PostGIS schema', () => {
@@ -97,7 +115,7 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
       (async () => {
         try {
           await source.initialize();
-          if (source.entityMetadatas.length !== 16) throw new Error('Wrong entity count');
+          if (source.entityMetadatas.length !== 21) throw new Error('Wrong entity count');
           for (const metadata of source.entityMetadatas) {
             for (const relation of metadata.relations) {
               if (relation.inverseRelation?.inverseRelation !== relation) throw new Error('Broken inverse relation');
@@ -270,6 +288,30 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
     const driver = await source
       .getRepository(DriverProfile)
       .save({ userId: user.id, vehicleType: 'bike' });
+    const plan = await source.getRepository(DriverCompensationPlan).save({
+      name: 'Relation plan',
+      type: 'PER_DELIVERY' as DriverCompensationPlan['type'],
+      components: {
+        deliveryAllocation: {
+          platformFixedAmount: '0',
+          platformPercentage: 0,
+          driverFixedAmount: '0',
+          driverPercentage: 0,
+          driverGetsRemainder: true,
+        },
+        recurringCharge: {
+          type: 'NONE',
+          amountMinorUnits: '0',
+          currency: 'USD',
+        },
+      },
+    });
+    const assignment = await source.getRepository(DriverPlanAssignment).save({
+      driverId: driver.id,
+      planId: plan.id,
+      createdById: user.id,
+      effectiveFrom: new Date('2026-01-01T00:00:00Z'),
+    });
     const role = await source.getRepository(AdminRoleAssignment).save({
       userId: user.id,
       grantedById: user.id,
@@ -345,13 +387,82 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
       responsePayload: { id: delivery.id },
       expiresAt: new Date(Date.now() + 3_600_000),
     });
+    const ledger = await source.transaction(async (manager) => {
+      const event = await manager.getRepository(LedgerEvent).save({
+        kind: 'charge',
+        sourceId: randomUUID(),
+        payloadHash: 'a'.repeat(64),
+        entryCount: 1,
+        createdById: user.id,
+        occurredAt: new Date('2026-11-07T08:00:00Z'),
+      });
+      const entry = await manager.getRepository(LedgerEntry).save({
+        eventId: event.id,
+        eventIndex: 0,
+        entryType: 'DRIVER_DAILY_CHARGE',
+        amount: '300',
+        currency: 'USD',
+        driverId: driver.id,
+        beneficiaryType: 'platform',
+        periodStart: '2026-11-07',
+        referenceType: 'charge',
+        referenceId: event.sourceId,
+        createdById: user.id,
+        occurredAt: event.occurredAt,
+      });
+      return { event, entry };
+    });
+    const financialSnapshot = await source.transaction(async (manager) => {
+      const quote = {
+        pricingRuleId: pricing.id,
+        pricingRuleEffectiveFrom: pricing.effectiveFrom.toISOString(),
+        distanceKm: 0,
+        baseFee: '0',
+        zoneSurcharge: '0',
+        perKmFee: '0',
+        codFee: '0',
+        totalFee: '0',
+        currency: 'USD',
+      };
+      await manager.getRepository(Delivery).update(delivery.id, {
+        pricingRuleId: pricing.id,
+        feeBreakdown: quote,
+      });
+      await manager.getRepository(LedgerEvent).save({
+        kind: 'priced',
+        sourceId: delivery.id,
+        payloadHash: 'a'.repeat(64),
+        entryCount: 0,
+        createdById: null,
+        occurredAt: new Date(),
+      });
+      return await manager.getRepository(DeliveryFinancialSnapshot).save({
+        deliveryId: delivery.id,
+        currency: 'USD',
+        customerDeliveryFee: '0',
+        driverEarnings: '0',
+        platformDeliveryRevenue: '0',
+        pricingRuleId: pricing.id,
+        driverCompensationPlanId: plan.id,
+        driverPlanAssignmentId: assignment.id,
+        lockedAt: new Date(),
+        eligibleFeeComponents: {
+          ...quote,
+          totalEligibleFee: '0',
+          paymentMethod: delivery.paymentMethod,
+        },
+      });
+    });
     return {
+      financialSnapshot,
       user,
       parent,
       region,
       business,
       member,
       driver,
+      plan,
+      assignment,
       role,
       token,
       address,
@@ -363,6 +474,7 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
       history,
       audit,
       idempotency,
+      ledger,
     };
   }
 
@@ -370,11 +482,16 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
     const graph = await seedGraph();
     const source = database.dataSource;
     const rows = new Map([
+      [DeliveryFinancialSnapshot, graph.financialSnapshot],
+      [LedgerEvent, graph.ledger.event],
+      [LedgerEntry, graph.ledger.entry],
       [User, graph.user],
       [Region, graph.region],
       [Business, graph.business],
       [BusinessMember, graph.member],
       [DriverProfile, graph.driver],
+      [DriverCompensationPlan, graph.plan],
+      [DriverPlanAssignment, graph.assignment],
       [AdminRoleAssignment, graph.role],
       [RefreshToken, graph.token],
       [Address, graph.address],
@@ -397,9 +514,9 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
         const value = loaded[relation.propertyName] as
           { id: string } | { id: string }[] | null;
         if (relation.isOwning) {
-          expect((value as { id: string }).id).toBe(
-            loaded[relation.joinColumns[0].propertyName],
-          );
+          const foreignKey = loaded[relation.joinColumns[0].propertyName];
+          if (foreignKey === null) expect(value).toBeNull();
+          else expect((value as { id: string }).id).toBe(foreignKey);
         } else {
           const child = rows.get(
             relation.inverseEntityMetadata.target as Function,
@@ -558,7 +675,9 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
       source.getRepository(User).delete(graph.user.id),
     ).rejects.toMatchObject({ code: '23503' });
 
-    await source.getRepository(DriverProfile).delete(graph.driver.id);
+    await expect(
+      source.getRepository(DriverProfile).delete(graph.driver.id),
+    ).rejects.toMatchObject({ code: '23503' });
     await source.getRepository(DeliveryZone).delete(graph.zone.id);
     // Snapshot immutability triggers intentionally block SET NULL/CASCADE
     // actions which would mutate or remove historical recipient/pickup rows.
@@ -574,8 +693,8 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
         pickupAddress: { region: true },
       },
     });
-    expect(delivery.driverId).toBeNull();
-    expect(delivery.driver).toBeNull();
+    expect(delivery.driverId).toBe(graph.driver.id);
+    expect(delivery.driver?.id).toBe(graph.driver.id);
     expect(delivery.zoneId).toBeNull();
     expect(delivery.zone).toBeNull();
     expect(delivery.recipient?.region?.id).toBe(graph.region.id);
@@ -647,7 +766,7 @@ describe('Entity relationships against the migrated PostGIS schema', () => {
       ORDER BY tbl.relname, col.attname
     `);
     expect(entities).toHaveLength(globSync('src/**/*.entity.ts').length);
-    expect(foreignKeys).toHaveLength(22);
+    expect(foreignKeys).toHaveLength(39);
     const owning = source.entityMetadatas.flatMap((metadata) =>
       metadata.relations.filter((relation) => relation.isOwning),
     );

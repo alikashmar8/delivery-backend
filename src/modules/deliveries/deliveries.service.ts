@@ -1,3 +1,8 @@
+import { FinanceService } from '../finance/finance.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuditRequestContext } from '../audit/audit-request-context';
+import { User, UserStatus } from '../users/entities/user.entity';
+import { DriverAvailability } from '../users/entities/driver-profile.entity';
 import {
   BadRequestException,
   ConflictException,
@@ -7,7 +12,14 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'node:crypto';
-import { DataSource, EntityManager, IsNull, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  IsNull,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import { PaginationQueryDto } from '../../common/dto/pagination.dto';
 import { resolveBillableDistance } from '../../common/geo/distance';
 import { parseMoney } from '../../common/money/money';
@@ -28,7 +40,9 @@ import {
 import { DriverProfile } from '../users/entities/driver-profile.entity';
 import { ZonesService } from '../zones/zones.service';
 import {
+  AssignDeliveryDto,
   CancelDeliveryDto,
+  CancellationReason,
   CreateDeliveryDto,
   TransitionDeliveryDto,
 } from './dto/delivery.dto';
@@ -43,6 +57,7 @@ import {
 } from './entities/delivery-status-history.entity';
 import {
   Delivery,
+  ACTIVE_DRIVER_DELIVERY_STATUSES,
   DeliveryStatus,
   PaymentMethod,
 } from './entities/delivery.entity';
@@ -75,6 +90,8 @@ export class DeliveriesService {
     private readonly driverProfiles: Repository<DriverProfile>,
     @InjectRepository(AdminRoleAssignment)
     private readonly adminRoles: Repository<AdminRoleAssignment>,
+    private readonly finance: FinanceService,
+    private readonly audit: AuditService,
   ) {}
 
   async create(
@@ -120,7 +137,9 @@ export class DeliveriesService {
       currency: dto.currency,
     });
     const deliveryFee = parseMoney(fee.totalFee, 'deliveryFee');
-    const collectableAmount = codAmount + deliveryFee;
+    const paymentMethod = dto.paymentMethod ?? PaymentMethod.COD;
+    const collectableAmount =
+      codAmount + (paymentMethod === PaymentMethod.COD ? deliveryFee : 0n);
     parseMoney(collectableAmount.toString(), 'collectableAmount');
 
     return await this.dataSource.transaction(async (manager) => {
@@ -189,7 +208,7 @@ export class DeliveriesService {
             totalFee: fee.totalFee,
             currency: fee.currency,
           },
-          paymentMethod: dto.paymentMethod ?? PaymentMethod.COD,
+          paymentMethod,
           notes: dto.notes ?? null,
           scheduledAt: dto.scheduledAt ? new Date(dto.scheduledAt) : null,
           pickedUpAt: null,
@@ -267,6 +286,174 @@ export class DeliveriesService {
     });
   }
 
+  async assign(
+    id: string,
+    dto: AssignDeliveryDto,
+    actorUserId: string,
+    idempotencyKey?: string,
+    context?: AuditRequestContext,
+  ): Promise<Delivery> {
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        if (
+          !(await manager.getRepository(User).exists({
+            where: { id: actorUserId, status: UserStatus.ACTIVE },
+          })) ||
+          !(await manager.getRepository(AdminRoleAssignment).exists({
+            where: {
+              userId: actorUserId,
+              active: true,
+              role: In([AdminRole.ADMIN, AdminRole.SUPER_ADMIN]),
+            },
+          }))
+        )
+          throw new ForbiddenException('Active operations admin required');
+        const payload = { deliveryId: id, ...dto };
+        if (idempotencyKey) {
+          await manager.query(
+            'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [`delivery.assign:${actorUserId}:${idempotencyKey}`],
+          );
+          const replay = await this.idempotencyService.checkAndReplay(
+            actorUserId,
+            'delivery.assign',
+            idempotencyKey,
+            payload,
+            manager,
+          );
+          if (replay) {
+            const existing = await manager
+              .getRepository(Delivery)
+              .findOneBy({ id });
+            if (!existing)
+              throw new ConflictException('Missing assignment aggregate');
+            return existing;
+          }
+        }
+        const repo = manager.getRepository(Delivery);
+        const delivery = await repo.findOne({
+          where: { id },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!delivery) throw new NotFoundException('Delivery not found');
+        if (delivery.version !== dto.expectedVersion)
+          throw new ConflictException(
+            'Delivery was modified by another request',
+          );
+        assertTransition(delivery.status, DeliveryStatus.ASSIGNED, 'admin');
+        if (delivery.driverId)
+          throw new ConflictException(
+            'Unassign the current driver before assignment',
+          );
+        const hasSnapshot = await this.finance.hasSnapshotWithManager(
+          manager,
+          id,
+        );
+        if (delivery.businessId) {
+          const business = await manager.getRepository(Business).findOne({
+            where: { id: delivery.businessId },
+            lock: { mode: 'pessimistic_read' },
+          });
+          if (!business || business.status !== BusinessStatus.ACTIVE)
+            throw new ForbiddenException('Business is not active');
+        }
+        const profiles = manager.getRepository(DriverProfile);
+        const driver = await profiles.findOne({
+          where: { id: dto.driverId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (
+          !driver ||
+          !driver.active ||
+          driver.currency !== 'USD' ||
+          driver.availability !== DriverAvailability.ONLINE
+        )
+          throw new ConflictException(
+            'An approved online USD driver is required',
+          );
+        const user = await manager.getRepository(User).findOne({
+          where: { id: driver.userId, status: UserStatus.ACTIVE },
+          lock: { mode: 'pessimistic_read' },
+        });
+        if (!user) throw new ConflictException('Driver user is not active');
+        if (
+          await repo.exists({
+            where: {
+              driverId: driver.id,
+              status: In(ACTIVE_DRIVER_DELIVERY_STATUSES),
+            },
+          })
+        )
+          throw new ConflictException('Driver already has an active delivery');
+        // Select time only after capacity/plan-change locks are held; transaction-start time may be stale.
+        const lockedAt = new Date();
+        delivery.driverId = driver.id;
+        delivery.status = DeliveryStatus.ASSIGNED;
+        delivery.version += 1;
+        const saved = await repo.save(delivery);
+        const snapshot = await this.finance[
+          hasSnapshot ? 'reassignWithManager' : 'priceWithManager'
+        ](manager, saved, driver.userId, actorUserId, lockedAt, context);
+        await profiles.update(driver.id, {
+          availability: DriverAvailability.ON_DELIVERY,
+          version: driver.version + 1,
+        });
+        await manager.getRepository(DeliveryStatusHistory).save({
+          deliveryId: id,
+          fromStatus: DeliveryStatus.CREATED,
+          toStatus: DeliveryStatus.ASSIGNED,
+          actorType: ActorType.ADMIN,
+          actorId: actorUserId,
+          note: 'Commercial assignment',
+          occurredAt: lockedAt,
+        });
+        await this.audit.recordWithManager(
+          manager,
+          actorUserId,
+          'delivery.assign',
+          'Delivery',
+          id,
+          {
+            businessId: delivery.businessId,
+            before: {
+              status: DeliveryStatus.CREATED,
+              driverId: null,
+              version: dto.expectedVersion,
+            },
+            after: {
+              status: saved.status,
+              driverId: driver.id,
+              version: saved.version,
+              financialSnapshotId: snapshot.id,
+            },
+            ...context,
+          },
+        );
+        if (idempotencyKey)
+          await this.idempotencyService.record(
+            actorUserId,
+            'delivery.assign',
+            idempotencyKey,
+            payload,
+            id,
+            toDeliveryResponse(saved),
+            24,
+            manager,
+          );
+        return saved;
+      });
+    } catch (error) {
+      if (error instanceof QueryFailedError) {
+        const code = (error.driverError as { code?: string }).code;
+        if (['23505', '23P01', '40001', '40P01'].includes(code ?? ''))
+          throw new ConflictException('Assignment conflict; reload and retry');
+        if (['23514', '23503', 'P0002'].includes(code ?? ''))
+          throw new BadRequestException('Invalid commercial assignment terms');
+      }
+      throw error;
+    }
+  }
+
   async findById(id: string): Promise<Delivery> {
     const delivery = await this.deliveryRepo.findOne({ where: { id } });
     if (!delivery) throw new NotFoundException('Delivery not found');
@@ -323,18 +510,18 @@ export class DeliveriesService {
     id: string,
     dto: TransitionDeliveryDto,
     actorUserId: string,
+    idempotencyKey?: string,
+    context?: AuditRequestContext,
   ): Promise<Delivery> {
-    await this.assertAdmin(actorUserId);
-    if (dto.toStatus === DeliveryStatus.ASSIGNED) {
-      throw new BadRequestException(
-        'Driver assignment is unavailable until Phase 5',
-      );
-    }
+    if (dto.toStatus === DeliveryStatus.ASSIGNED)
+      throw new BadRequestException('Use the commercial assignment endpoint');
     return await this.transitionAtomic(
       id,
       dto,
-      { type: ActorType.ADMIN, id: actorUserId },
-      'admin',
+      actorUserId,
+      true,
+      idempotencyKey,
+      context,
     );
   }
 
@@ -342,45 +529,17 @@ export class DeliveriesService {
     id: string,
     dto: CancelDeliveryDto,
     actorUserId: string,
+    idempotencyKey?: string,
+    context?: AuditRequestContext,
   ): Promise<Delivery> {
-    return await this.dataSource.transaction(async (manager) => {
-      const deliveryRepo = manager.getRepository(Delivery);
-      const delivery = await deliveryRepo.findOne({
-        where: { id },
-        lock: { mode: 'pessimistic_write' },
-      });
-      if (!delivery) throw new NotFoundException('Delivery not found');
-
-      let actorType = ActorType.USER;
-      let actorKind: ActorKind = 'user';
-      if (delivery.businessId) {
-        await this.assertBusinessActive(
-          delivery.businessId,
-          manager.getRepository(Business),
-        );
-        await this.assertActiveBusinessMember(
-          delivery.businessId,
-          actorUserId,
-          manager.getRepository(BusinessMember),
-        );
-        actorType = ActorType.BUSINESS;
-        actorKind = 'business';
-      } else if (delivery.createdByUserId !== actorUserId) {
-        throw new ForbiddenException('Not your delivery');
-      }
-
-      return await this.applyTransition(
-        manager,
-        delivery,
-        {
-          toStatus: DeliveryStatus.CANCELLED,
-          expectedVersion: dto.expectedVersion,
-          reason: dto.reason,
-        },
-        { type: actorType, id: actorUserId },
-        actorKind,
-      );
-    });
+    return await this.transitionAtomic(
+      id,
+      { ...dto, toStatus: DeliveryStatus.CANCELLED },
+      actorUserId,
+      false,
+      idempotencyKey,
+      context,
+    );
   }
 
   async getHistory(
@@ -423,23 +582,101 @@ export class DeliveriesService {
   private async transitionAtomic(
     id: string,
     dto: TransitionDeliveryDto,
-    actor: { type: ActorType; id: string | null },
-    actorKind: ActorKind,
+    actorUserId: string,
+    asAdmin: boolean,
+    idempotencyKey?: string,
+    context?: AuditRequestContext,
   ): Promise<Delivery> {
-    return await this.dataSource.transaction(async (manager) => {
-      const delivery = await manager.getRepository(Delivery).findOne({
-        where: { id },
-        lock: { mode: 'pessimistic_write' },
+    const operation = asAdmin ? 'delivery.transition' : 'delivery.cancel';
+    const payload = { deliveryId: id, ...dto };
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        if (idempotencyKey)
+          await manager.query(
+            'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [`${operation}:${actorUserId}:${idempotencyKey}`],
+          );
+        const delivery = await manager
+          .getRepository(Delivery)
+          .findOne({ where: { id }, lock: { mode: 'pessimistic_write' } });
+        if (!delivery) throw new NotFoundException('Delivery not found');
+        let actorType = ActorType.ADMIN;
+        let actorKind: ActorKind = 'admin';
+        if (asAdmin) {
+          await this.assertAdmin(actorUserId, manager);
+          if (delivery.businessId)
+            await this.assertBusinessActive(
+              delivery.businessId,
+              manager.getRepository(Business),
+            );
+        } else {
+          if (
+            !(await manager.getRepository(User).exists({
+              where: { id: actorUserId, status: UserStatus.ACTIVE },
+            }))
+          )
+            throw new ForbiddenException('Active sender required');
+          if (delivery.businessId) {
+            await this.assertBusinessActive(
+              delivery.businessId,
+              manager.getRepository(Business),
+            );
+            await this.assertActiveBusinessMember(
+              delivery.businessId,
+              actorUserId,
+              manager.getRepository(BusinessMember),
+            );
+            actorType = ActorType.BUSINESS;
+            actorKind = 'business';
+          } else {
+            if (delivery.createdByUserId !== actorUserId)
+              throw new ForbiddenException('Not your delivery');
+            actorType = ActorType.USER;
+            actorKind = 'user';
+          }
+        }
+        if (
+          idempotencyKey &&
+          (await this.idempotencyService.checkAndReplay(
+            actorUserId,
+            operation,
+            idempotencyKey,
+            payload,
+            manager,
+          ))
+        )
+          return delivery;
+        const updated = await this.applyTransition(
+          manager,
+          delivery,
+          dto,
+          { type: actorType, id: actorUserId },
+          actorKind,
+          context,
+        );
+        if (idempotencyKey)
+          await this.idempotencyService.record(
+            actorUserId,
+            operation,
+            idempotencyKey,
+            payload,
+            id,
+            toDeliveryResponse(updated),
+            24,
+            manager,
+          );
+        return updated;
       });
-      if (!delivery) throw new NotFoundException('Delivery not found');
-      return await this.applyTransition(
-        manager,
-        delivery,
-        dto,
-        actor,
-        actorKind,
-      );
-    });
+    } catch (error) {
+      if (error instanceof QueryFailedError) {
+        const code = (error.driverError as { code?: string }).code;
+        if (['23505', '23P01', '40001', '40P01'].includes(code ?? ''))
+          throw new ConflictException('Transition conflict; reload and retry');
+        if (['23514', '23503', 'P0002'].includes(code ?? ''))
+          throw new BadRequestException('Invalid transition terms');
+      }
+      throw error;
+    }
   }
 
   private async applyTransition(
@@ -448,12 +685,55 @@ export class DeliveriesService {
     dto: TransitionDeliveryDto,
     actor: { type: ActorType; id: string | null },
     actorKind: ActorKind,
+    context?: AuditRequestContext,
   ): Promise<Delivery> {
     if (delivery.version !== dto.expectedVersion) {
       throw new ConflictException('Delivery was modified by another request');
     }
     assertTransition(delivery.status, dto.toStatus, actorKind);
     this.assertEvidence(delivery.status, dto);
+    const unassign = dto.toStatus === DeliveryStatus.CREATED;
+    const cancel = dto.toStatus === DeliveryStatus.CANCELLED;
+    if (
+      [
+        DeliveryStatus.FAILED,
+        DeliveryStatus.RETURNED,
+        DeliveryStatus.DELIVERED,
+      ].includes(dto.toStatus) &&
+      (await this.finance.hasSnapshotWithManager(manager, delivery.id))
+    )
+      throw new ConflictException(
+        'Commercial attempt, return and completion require D02 evidence',
+      );
+    if (unassign)
+      await this.finance.unassignWithManager(
+        manager,
+        delivery.id,
+        actor.id!,
+        context,
+      );
+    if (cancel)
+      await this.finance.reversePricedWithManager(
+        manager,
+        delivery.id,
+        actor.id!,
+        context,
+      );
+    if (delivery.driverId && (unassign || cancel)) {
+      const profiles = manager.getRepository(DriverProfile);
+      const driver = await profiles.findOne({
+        where: { id: delivery.driverId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (driver && driver.availability === DriverAvailability.ON_DELIVERY)
+        await profiles.update(driver.id, {
+          availability: driver.active
+            ? DriverAvailability.ONLINE
+            : DriverAvailability.OFFLINE,
+          version: driver.version + 1,
+        });
+    }
+
     if (dto.toStatus === DeliveryStatus.IN_TRANSIT && !delivery.driverId) {
       throw new BadRequestException(
         'A driver must be assigned before dispatch',
@@ -463,12 +743,18 @@ export class DeliveriesService {
     const patch: Partial<
       Pick<
         Delivery,
-        'status' | 'version' | 'pickedUpAt' | 'deliveredAt' | 'scheduledAt'
+        | 'status'
+        | 'version'
+        | 'driverId'
+        | 'pickedUpAt'
+        | 'deliveredAt'
+        | 'scheduledAt'
       >
     > = {
       status: dto.toStatus,
       version: dto.expectedVersion + 1,
     };
+    if (unassign) patch.driverId = null;
     if (dto.toStatus === DeliveryStatus.PICKED_UP)
       patch.pickedUpAt = new Date();
     if (dto.toStatus === DeliveryStatus.DELIVERED)
@@ -500,6 +786,28 @@ export class DeliveriesService {
 
     const updated = await deliveryRepo.findOne({ where: { id: delivery.id } });
     if (!updated) throw new NotFoundException('Delivery not found');
+    await this.audit.recordWithManager(
+      manager,
+      actor.id!,
+      unassign ? 'delivery.unassign' : 'delivery.transition',
+      'Delivery',
+      delivery.id,
+      {
+        businessId: delivery.businessId,
+        before: {
+          status: delivery.status,
+          driverId: delivery.driverId,
+          version: delivery.version,
+        },
+        after: {
+          status: updated.status,
+          driverId: updated.driverId,
+          version: updated.version,
+          reason: dto.reason ?? null,
+        },
+        ...context,
+      },
+    );
     return updated;
   }
 
@@ -517,6 +825,13 @@ export class DeliveriesService {
     if (requiresReason && !dto.reason?.trim()) {
       throw new BadRequestException('A transition reason is required');
     }
+    if (
+      dto.toStatus === DeliveryStatus.CANCELLED &&
+      !Object.values(CancellationReason).includes(
+        dto.reason as CancellationReason,
+      )
+    )
+      throw new BadRequestException('A valid cancellation reason is required');
     if (dto.toStatus === DeliveryStatus.RESCHEDULED && !dto.scheduledAt) {
       throw new BadRequestException(
         'scheduledAt is required when rescheduling',
@@ -598,15 +913,23 @@ export class DeliveriesService {
     }
   }
 
-  private async assertAdmin(userId: string): Promise<void> {
-    const assignment = await this.adminRoles.findOne({
-      where: [
-        { userId, role: AdminRole.SUPER_ADMIN, active: true },
-        { userId, role: AdminRole.ADMIN, active: true },
-        { userId, role: AdminRole.SUPPORT, active: true },
-      ],
-    });
-    if (!assignment) throw new ForbiddenException('Admin role required');
+  private async assertAdmin(
+    userId: string,
+    manager: EntityManager,
+  ): Promise<void> {
+    if (
+      !(await manager
+        .getRepository(User)
+        .exists({ where: { id: userId, status: UserStatus.ACTIVE } })) ||
+      !(await manager.getRepository(AdminRoleAssignment).exists({
+        where: {
+          userId,
+          active: true,
+          role: In([AdminRole.SUPER_ADMIN, AdminRole.ADMIN]),
+        },
+      }))
+    )
+      throw new ForbiddenException('Active operations admin required');
   }
 
   private generateTrackingCode(): string {

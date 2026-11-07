@@ -1,8 +1,12 @@
+import type { Request } from 'express';
+import { getAuditRequestContext } from '../audit/audit-request-context';
 import {
   Body,
   Controller,
   Get,
   Headers,
+  HttpCode,
+  Req,
   Param,
   ParseUUIDPipe,
   Post,
@@ -30,6 +34,7 @@ import { AdminRole } from '../users/entities/admin-role-assignment.entity';
 import { User } from '../users/entities/user.entity';
 import { DeliveriesService } from './deliveries.service';
 import {
+  AssignDeliveryDto,
   CancelDeliveryDto,
   CreateDeliveryDto,
   ListDeliveriesQueryDto,
@@ -184,9 +189,53 @@ export class DeliveriesController {
     };
   }
 
-  @Post(':id/transition')
+  @Post(':id/assign')
+  @HttpCode(200)
   @UseGuards(RBACGuard)
-  @RequiredRoles(AdminRole.SUPER_ADMIN, AdminRole.ADMIN, AdminRole.SUPPORT)
+  @RequiredRoles(AdminRole.ADMIN)
+  @ApiSecurity('Idempotency-Key')
+  @ApiOperation({
+    summary: 'Assign an eligible driver and commit immutable commercial terms',
+  })
+  @ApiResponse({ status: 200, type: DeliveryResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Invalid driver, version, quote or financial terms',
+  })
+  @ApiUnauthorizedResponse({ description: 'Authentication required' })
+  @ApiForbiddenResponse({
+    description: 'Active operations admin and eligible business required',
+  })
+  @ApiNotFoundResponse({ description: 'Delivery not found' })
+  @ApiConflictResponse({
+    description:
+      'Stale state, busy driver, unavailable plan or conflicting replay',
+  })
+  async assign(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AssignDeliveryDto,
+    @CurrentUser() user: User,
+    @Req() request: Request,
+    @Headers('idempotency-key') key?: string,
+  ) {
+    const idempotencyKey = this.idempotency.extractKey({
+      'idempotency-key': key,
+    });
+    return toDeliveryResponse(
+      await this.deliveries.assign(
+        id,
+        dto,
+        user.id,
+        idempotencyKey ?? undefined,
+        getAuditRequestContext(request),
+      ),
+    );
+  }
+
+  @Post(':id/transition')
+  @HttpCode(200)
+  @ApiSecurity('Idempotency-Key')
+  @UseGuards(RBACGuard)
+  @RequiredRoles(AdminRole.ADMIN)
   @ApiOperation({ summary: 'Admin: transition delivery status' })
   @ApiResponse({
     status: 200,
@@ -201,16 +250,25 @@ export class DeliveriesController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: TransitionDeliveryDto,
     @CurrentUser() user: User,
+    @Req() request: Request,
+    @Headers('idempotency-key') key?: string,
   ) {
     return toDeliveryResponse(
-      await this.deliveries.transitionAsAdmin(id, dto, user.id),
+      await this.deliveries.transitionAsAdmin(
+        id,
+        dto,
+        user.id,
+        this.idempotency.extractKey({ 'idempotency-key': key }) ?? undefined,
+        getAuditRequestContext(request),
+      ),
     );
   }
 
   @Post(':id/cancel')
+  @ApiSecurity('Idempotency-Key')
   @ApiOperation({ summary: 'Cancel delivery as sender' })
   @ApiResponse({
-    status: 200,
+    status: 201,
     description: 'Delivery cancelled successfully',
     type: DeliveryResponseDto,
   })
@@ -224,9 +282,17 @@ export class DeliveriesController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CancelDeliveryDto,
     @CurrentUser() user: User,
+    @Req() request: Request,
+    @Headers('idempotency-key') key?: string,
   ) {
     return toDeliveryResponse(
-      await this.deliveries.cancelAsSender(id, dto, user.id),
+      await this.deliveries.cancelAsSender(
+        id,
+        dto,
+        user.id,
+        this.idempotency.extractKey({ 'idempotency-key': key }) ?? undefined,
+        getAuditRequestContext(request),
+      ),
     );
   }
 }

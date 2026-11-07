@@ -1,3 +1,5 @@
+import { FinanceModule } from '../finance/finance.module';
+import { AuditModule } from '../audit/audit.module';
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { BusinessesModule } from '../businesses/businesses.module';
@@ -15,6 +17,8 @@ import { Recipient } from './entities/recipient.entity';
 
 @Module({
   imports: [
+    FinanceModule,
+    AuditModule,
     TypeOrmModule.forFeature([
       Delivery,
       Recipient,

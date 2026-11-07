@@ -4,6 +4,7 @@ import {
   IsDateString,
   IsEnum,
   IsInt,
+  IsIn,
   IsNotEmpty,
   IsNumber,
   IsObject,
@@ -164,10 +165,9 @@ export class CreateDeliveryDto {
   @IsOptional()
   @IsEnum(PaymentMethod)
   paymentMethod?: PaymentMethod;
-  @ApiPropertyOptional({ minLength: 3, maxLength: 3, example: 'USD' })
+  @ApiPropertyOptional({ enum: ['USD'] })
   @IsOptional()
-  @IsString()
-  @Length(3, 3)
+  @IsIn(['USD'])
   currency?: string;
   @ApiPropertyOptional({
     pattern: '^(0|[1-9]\\d*)$',
@@ -234,6 +234,7 @@ export class TransitionDeliveryDto {
   @ApiPropertyOptional({ maxLength: 1000 })
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiPropertyOptional({ format: 'date-time' })
@@ -265,4 +266,15 @@ export class ListDeliveriesQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(DeliveryStatus)
   status?: DeliveryStatus;
+}
+
+export class AssignDeliveryDto {
+  @ApiProperty({ format: 'uuid' })
+  @IsUUID()
+  driverId!: string;
+
+  @ApiProperty({ minimum: 1 })
+  @IsInt()
+  @Min(1)
+  expectedVersion!: number;
 }

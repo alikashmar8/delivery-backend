@@ -1,3 +1,6 @@
+import { DeliveryFinancialSnapshot } from '../src/modules/finance/entities/delivery-financial-snapshot.entity';
+import { LedgerEntry } from '../src/modules/finance/entities/ledger-entry.entity';
+import { LedgerEvent } from '../src/modules/finance/entities/ledger-event.entity';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { ZonesService } from '../src/modules/zones/zones.service';
@@ -24,6 +27,8 @@ import { Recipient } from '../src/modules/deliveries/entities/recipient.entity';
 import { PricingRule } from '../src/modules/pricing/entities/pricing-rule.entity';
 import { Region } from '../src/modules/regions/entities/region.entity';
 import { AdminRoleAssignment } from '../src/modules/users/entities/admin-role-assignment.entity';
+import { DriverCompensationPlan } from '../src/modules/finance/entities/driver-compensation-plan.entity';
+import { DriverPlanAssignment } from '../src/modules/finance/entities/driver-plan-assignment.entity';
 import { DriverProfile } from '../src/modules/users/entities/driver-profile.entity';
 import { RefreshToken } from '../src/modules/users/entities/refresh-token.entity';
 import { User } from '../src/modules/users/entities/user.entity';
@@ -33,6 +38,11 @@ import { createPostgisDatabase } from './helpers/postgis-database';
 const entities = [
   User,
   DriverProfile,
+  DriverCompensationPlan,
+  DriverPlanAssignment,
+  LedgerEntry,
+  LedgerEvent,
+  DeliveryFinancialSnapshot,
   AdminRoleAssignment,
   RefreshToken,
   Business,
@@ -63,6 +73,15 @@ const migrations = [
   AddDeliveryPricingProvenance1700000000010,
 ];
 
+// This fixture stops at the state immediately after the 0007 rename so it can
+// exercise 0007 up/down/up against populated legacy columns. C04's version
+// column is intentionally absent: migration 0012 depends on the renamed
+// camelCase columns and therefore cannot be applied before this test's first
+// 0007 up.
+const propertiesAddedAfterCamelCaseRename: Record<string, string[]> = {
+  driver_profiles: ['version'],
+};
+
 describe('CamelCase column migration on populated legacy tables', () => {
   let database: Awaited<ReturnType<typeof createPostgisDatabase>>;
 
@@ -83,6 +102,14 @@ describe('CamelCase column migration on populated legacy tables', () => {
     const source = database.dataSource;
     const snapshot: Record<string, unknown[]> = {};
     for (const metadata of source.entityMetadatas) {
+      if (
+        metadata.tableName === 'delivery_financial_snapshots' ||
+        metadata.tableName === 'ledger_entries' ||
+        metadata.tableName === 'ledger_events' ||
+        metadata.tableName === 'driver_compensation_plans' ||
+        metadata.tableName === 'driver_plan_assignments'
+      )
+        continue;
       const rows: Record<string, unknown>[] = await source.query(
         `SELECT * FROM "${metadata.tableName}" ORDER BY id LIMIT 1000`,
       );
@@ -161,12 +188,28 @@ describe('CamelCase column migration on populated legacy tables', () => {
     expect(await snapshotRows()).toEqual(before);
     expect(await schemaObjects()).toEqual(objects);
     for (const metadata of source.entityMetadatas) {
+      if (
+        metadata.tableName === 'delivery_financial_snapshots' ||
+        metadata.tableName === 'ledger_entries' ||
+        metadata.tableName === 'ledger_events' ||
+        metadata.tableName === 'driver_compensation_plans' ||
+        metadata.tableName === 'driver_plan_assignments'
+      )
+        continue;
       const columns: { column_name: string }[] = await source.query(
         `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 ORDER BY column_name`,
         [metadata.tableName],
       );
       expect(columns.map((column) => column.column_name)).toEqual(
-        metadata.columns.map((column) => column.propertyName).sort(),
+        metadata.columns
+          .map((column) => column.propertyName)
+          .filter(
+            (property) =>
+              !propertiesAddedAfterCamelCaseRename[
+                metadata.tableName
+              ]?.includes(property),
+          )
+          .sort(),
       );
     }
     const loaded = await source.getRepository(Delivery).findOneOrFail({

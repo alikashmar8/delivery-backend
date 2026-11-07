@@ -83,6 +83,8 @@ describe('collection pagination', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
+      {} as never,
     );
 
     await service.findAll('user-id', { take: 7, skip: 14 });

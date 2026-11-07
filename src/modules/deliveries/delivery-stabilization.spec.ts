@@ -86,6 +86,8 @@ describe('transactional stabilization', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
+      {} as never,
     );
 
     await expect(
@@ -123,6 +125,7 @@ describe('transactional stabilization', () => {
       update: vi.fn().mockResolvedValue({ affected: 1 }),
     };
     const historyRepo = {
+      exists: vi.fn().mockResolvedValue(true),
       create: vi.fn((value) => value),
       save: vi.fn().mockRejectedValue(new Error('history insert failed')),
     };
@@ -150,6 +153,8 @@ describe('transactional stabilization', () => {
       {} as never,
       {} as never,
       adminRepo as never,
+      { hasSnapshotWithManager: vi.fn().mockResolvedValue(false) } as never,
+      {} as never,
     );
 
     await expect(

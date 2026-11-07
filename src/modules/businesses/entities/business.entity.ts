@@ -1,3 +1,4 @@
+import type { LedgerEntry } from '../../finance/entities/ledger-entry.entity';
 import {
   Column,
   CreateDateColumn,
@@ -71,4 +72,9 @@ export class Business {
     persistence: false,
   })
   deliveries?: Relation<Delivery[]>;
+
+  @OneToMany('LedgerEntry', (entry: LedgerEntry) => entry.beneficiaryBusiness, {
+    persistence: false,
+  })
+  ledgerEntries?: Relation<LedgerEntry[]>;
 }

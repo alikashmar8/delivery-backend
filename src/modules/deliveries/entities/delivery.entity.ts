@@ -1,3 +1,5 @@
+import type { DeliveryFinancialSnapshot } from '../../finance/entities/delivery-financial-snapshot.entity';
+import type { LedgerEntry } from '../../finance/entities/ledger-entry.entity';
 import type { Relation } from 'typeorm';
 import {
   Column,
@@ -32,6 +34,16 @@ export enum DeliveryStatus {
   RETURNED = 'RETURNED',
   CANCELLED = 'CANCELLED',
 }
+
+export const ACTIVE_DRIVER_DELIVERY_STATUSES = [
+  DeliveryStatus.ASSIGNED,
+  DeliveryStatus.ACCEPTED,
+  DeliveryStatus.PICKED_UP,
+  DeliveryStatus.IN_TRANSIT,
+  DeliveryStatus.ARRIVED,
+  DeliveryStatus.FAILED,
+  DeliveryStatus.RESCHEDULED,
+];
 
 export enum PaymentMethod {
   COD = 'cod',
@@ -195,4 +207,16 @@ export class Delivery {
     { persistence: false },
   )
   statusHistory?: Relation<DeliveryStatusHistory[]>;
+
+  @OneToMany('LedgerEntry', (entry: LedgerEntry) => entry.delivery, {
+    persistence: false,
+  })
+  ledgerEntries?: Relation<LedgerEntry[]>;
+
+  @OneToOne(
+    'DeliveryFinancialSnapshot',
+    (snapshot: DeliveryFinancialSnapshot) => snapshot.delivery,
+    { persistence: false },
+  )
+  financialSnapshot?: Relation<DeliveryFinancialSnapshot | null>;
 }

@@ -9,6 +9,7 @@ import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BusinessesModule } from './modules/businesses/businesses.module';
 import { DeliveriesModule } from './modules/deliveries/deliveries.module';
+import { FinanceModule } from './modules/finance/finance.module';
 import { PricingModule } from './modules/pricing/pricing.module';
 import { RegionsModule } from './modules/regions/regions.module';
 import { UsersModule } from './modules/users/users.module';
@@ -42,6 +43,7 @@ import { validateEnvironment } from './config/env.validation';
     ZonesModule,
     PricingModule,
     DeliveriesModule,
+    FinanceModule,
   ],
 })
 export class AppModule {}

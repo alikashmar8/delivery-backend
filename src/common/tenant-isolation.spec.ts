@@ -73,6 +73,8 @@ describe('cross-business isolation', () => {
       {} as never,
       { findOne: vi.fn().mockResolvedValue(null) } as never,
       { findOne: vi.fn().mockResolvedValue(null) } as never,
+      {} as never,
+      {} as never,
     );
     await expect(
       deliveries.findAuthorizedById('delivery-id', 'business-a-user'),

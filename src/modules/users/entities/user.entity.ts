@@ -1,3 +1,5 @@
+import type { LedgerEvent } from '../../finance/entities/ledger-event.entity';
+import type { LedgerEntry } from '../../finance/entities/ledger-entry.entity';
 import type { Relation } from 'typeorm';
 import {
   Column,
@@ -12,6 +14,7 @@ import {
 import type { Address } from '../../addresses/entities/address.entity';
 import type { BusinessMember } from '../../businesses/entities/business-member.entity';
 import type { Delivery } from '../../deliveries/entities/delivery.entity';
+import type { DriverPlanAssignment } from '../../finance/entities/driver-plan-assignment.entity';
 import type { Recipient } from '../../deliveries/entities/recipient.entity';
 import type { AdminRoleAssignment } from './admin-role-assignment.entity';
 import type { DriverProfile } from './driver-profile.entity';
@@ -106,4 +109,26 @@ export class User {
     persistence: false,
   })
   recipientSnapshots?: Relation<Recipient[]>;
+
+  @OneToMany(
+    'DriverPlanAssignment',
+    (assignment: DriverPlanAssignment) => assignment.createdBy,
+    { persistence: false },
+  )
+  createdPlanAssignments?: Relation<DriverPlanAssignment[]>;
+
+  @OneToMany('LedgerEvent', (entry: LedgerEvent) => entry.createdBy, {
+    persistence: false,
+  })
+  createdLedgerEvents?: Relation<LedgerEvent[]>;
+
+  @OneToMany('LedgerEntry', (entry: LedgerEntry) => entry.createdBy, {
+    persistence: false,
+  })
+  createdLedgerEntries?: Relation<LedgerEntry[]>;
+
+  @OneToMany('LedgerEntry', (entry: LedgerEntry) => entry.beneficiaryUser, {
+    persistence: false,
+  })
+  beneficiaryLedgerEntries?: Relation<LedgerEntry[]>;
 }

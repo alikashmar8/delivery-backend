@@ -1,3 +1,8 @@
+import { AddPricedSnapshots1700000000015 } from '../src/database/migrations/1700000000015-AddPricedSnapshots';
+import { DeliveryFinancialSnapshot } from '../src/modules/finance/entities/delivery-financial-snapshot.entity';
+import { AddImmutableLedger1700000000014 } from '../src/database/migrations/1700000000014-AddImmutableLedger';
+import { LedgerEntry } from '../src/modules/finance/entities/ledger-entry.entity';
+import { LedgerEvent } from '../src/modules/finance/entities/ledger-event.entity';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -18,6 +23,8 @@ import { CreateIdempotencyTable1700000000008 } from '../src/database/migrations/
 import { CreateAuditTable1700000000009 } from '../src/database/migrations/1700000000009-CreateAuditTable';
 import { AddDeliveryPricingProvenance1700000000010 } from '../src/database/migrations/1700000000010-AddDeliveryPricingProvenance';
 import { EnforceUniqueAdminRoleAssignments1700000000011 } from '../src/database/migrations/1700000000011-EnforceUniqueAdminRoleAssignments';
+import { AddDriverCapabilityLifecycle1700000000012 } from '../src/database/migrations/1700000000012-AddDriverCapabilityLifecycle';
+import { AddDriverCompensationPlans1700000000013 } from '../src/database/migrations/1700000000013-AddDriverCompensationPlans';
 import { Address } from '../src/modules/addresses/entities/address.entity';
 import { AuditLog } from '../src/modules/audit/entities/audit-log.entity';
 import { BusinessMember } from '../src/modules/businesses/entities/business-member.entity';
@@ -30,6 +37,8 @@ import { IdempotencyKey } from '../src/modules/idempotency/entities/idempotency-
 import { PricingRule } from '../src/modules/pricing/entities/pricing-rule.entity';
 import { Region } from '../src/modules/regions/entities/region.entity';
 import { AdminRoleAssignment } from '../src/modules/users/entities/admin-role-assignment.entity';
+import { DriverCompensationPlan } from '../src/modules/finance/entities/driver-compensation-plan.entity';
+import { DriverPlanAssignment } from '../src/modules/finance/entities/driver-plan-assignment.entity';
 import { DriverProfile } from '../src/modules/users/entities/driver-profile.entity';
 import { RefreshToken } from '../src/modules/users/entities/refresh-token.entity';
 import { User } from '../src/modules/users/entities/user.entity';
@@ -39,6 +48,11 @@ import { createPostgisDatabase } from './helpers/postgis-database';
 const entities = [
   User,
   DriverProfile,
+  DriverCompensationPlan,
+  DriverPlanAssignment,
+  LedgerEntry,
+  LedgerEvent,
+  DeliveryFinancialSnapshot,
   AdminRoleAssignment,
   RefreshToken,
   Business,
@@ -67,6 +81,10 @@ const migrations = [
   CreateAuditTable1700000000009,
   AddDeliveryPricingProvenance1700000000010,
   EnforceUniqueAdminRoleAssignments1700000000011,
+  AddDriverCapabilityLifecycle1700000000012,
+  AddDriverCompensationPlans1700000000013,
+  AddImmutableLedger1700000000014,
+  AddPricedSnapshots1700000000015,
 ];
 
 describe('persistent delivery idempotency through the compiled entrypoint', () => {
@@ -77,7 +95,9 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
   const accessSecret = 's04-compiled-access-secret-value';
   const refreshSecret = 's04-compiled-refresh-secret-value';
   const email = `s04-compiled-${randomUUID()}@example.test`;
+  const otherEmail = `c01-compiled-${randomUUID()}@example.test`;
   const password = 's04-compiled-password';
+  let ruleId: string;
 
   beforeAll(async () => {
     database = await createPostgisDatabase(entities, migrations);
@@ -88,7 +108,13 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
       displayName: 'S04 compiled user',
       passwordHash: await hash(password),
     });
-    await source.getRepository(PricingRule).save({
+    await source.getRepository(User).save({
+      phone: '+96171000003',
+      email: otherEmail,
+      displayName: 'C01 compiled other user',
+      passwordHash: await hash(password),
+    });
+    const rule = await source.getRepository(PricingRule).save({
       businessId: null,
       zoneId: null,
       currency: 'USD',
@@ -100,6 +126,7 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
       active: true,
       effectiveTo: null,
     });
+    ruleId = rule.id;
     expect(user.id).toEqual(expect.any(String));
     await startCompiledApp();
   });
@@ -179,11 +206,11 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
     exited = undefined;
   }
 
-  async function login(): Promise<string> {
+  async function login(loginEmail = email): Promise<string> {
     const response = await fetch(`${baseUrl}/auth/login/password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email: loginEmail, password }),
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { accessToken: string };
@@ -212,7 +239,7 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
   async function createDelivery(
     token: string,
     key: string,
-    body: ReturnType<typeof deliveryBody>,
+    body: ReturnType<typeof deliveryBody> & { distanceKm?: number },
   ): Promise<Response> {
     return await fetch(`${baseUrl}/deliveries`, {
       method: 'POST',
@@ -263,5 +290,70 @@ describe('persistent delivery idempotency through the compiled entrypoint', () =
     const restarted = await createDelivery(restartedToken, key, body);
     expect(restarted.status).toBe(201);
     expect(await restarted.json()).toEqual(firstBody);
+  });
+
+  it('serves the trusted quote contract through compiled HTTP', async () => {
+    const schemaResponse = await fetch(`${baseUrl}/docs-json`);
+    expect(schemaResponse.status).toBe(200);
+    const schema = (await schemaResponse.json()) as {
+      components: {
+        schemas: {
+          DeliveryResponseDto: {
+            properties: { pricingRuleId: { type: string[] } };
+          };
+        };
+      };
+    };
+    expect(
+      schema.components.schemas.DeliveryResponseDto.properties.pricingRuleId
+        .type,
+    ).toEqual(['string', 'null']);
+
+    expect((await fetch(`${baseUrl}/deliveries`)).status).toBe(401);
+    const token = await login();
+    const profile = await fetch(`${baseUrl}/users/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(profile.status).toBe(200);
+
+    const body = deliveryBody('c01 quote');
+    const created = await createDelivery(token, randomUUID(), body);
+    expect(created.status).toBe(201);
+    const quote = (await created.json()) as {
+      id: string;
+      pricingRuleId: string;
+      quotedDistanceKm: number;
+      deliveryFee: string;
+      feeBreakdown: {
+        pricingRuleId: string;
+        distanceKm: number;
+        totalFee: string;
+      };
+    };
+    expect(quote.pricingRuleId).toBe(ruleId);
+    expect(quote.quotedDistanceKm).toBeGreaterThan(0);
+    expect(quote.feeBreakdown).toMatchObject({
+      pricingRuleId: ruleId,
+      distanceKm: quote.quotedDistanceKm,
+      totalFee: quote.deliveryFee,
+    });
+
+    const read = await fetch(`${baseUrl}/deliveries/${quote.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(read.status).toBe(200);
+    expect(await read.json()).toEqual(quote);
+
+    const otherToken = await login(otherEmail);
+    const inaccessible = await fetch(`${baseUrl}/deliveries/${quote.id}`, {
+      headers: { Authorization: `Bearer ${otherToken}` },
+    });
+    expect(inaccessible.status).toBe(404);
+
+    const tooShort = await createDelivery(token, randomUUID(), {
+      ...body,
+      distanceKm: 0.001,
+    });
+    expect(tooShort.status).toBe(400);
   });
 });

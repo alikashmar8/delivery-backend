@@ -3,11 +3,11 @@ import {
   IsBoolean,
   IsDateString,
   IsInt,
+  IsIn,
   IsNumber,
   IsOptional,
   IsString,
   IsUUID,
-  Length,
   Matches,
   Max,
   Min,
@@ -25,10 +25,9 @@ export class CreatePricingRuleDto {
   @IsOptional()
   @IsUUID()
   zoneId?: string;
-  @ApiPropertyOptional({ minLength: 3, maxLength: 3, example: 'USD' })
+  @ApiPropertyOptional({ enum: ['USD'] })
   @IsOptional()
-  @IsString()
-  @Length(3, 3)
+  @IsIn(['USD'])
   currency?: string;
 
   @ApiProperty({
@@ -88,10 +87,9 @@ export class CreatePricingRuleDto {
 }
 
 export class UpdatePricingRuleDto {
-  @ApiPropertyOptional({ minLength: 3, maxLength: 3, example: 'USD' })
+  @ApiPropertyOptional({ enum: ['USD'] })
   @IsOptional()
-  @IsString()
-  @Length(3, 3)
+  @IsIn(['USD'])
   currency?: string;
   @ApiPropertyOptional({
     pattern: '^(0|[1-9]\\d*)$',
@@ -162,10 +160,9 @@ export class ComputeFeeDto {
   @Min(0)
   @Max(100_000)
   distanceKm?: number;
-  @ApiPropertyOptional({ minLength: 3, maxLength: 3, example: 'USD' })
+  @ApiPropertyOptional({ enum: ['USD'] })
   @IsOptional()
-  @IsString()
-  @Length(3, 3)
+  @IsIn(['USD'])
   currency?: string;
 }
 

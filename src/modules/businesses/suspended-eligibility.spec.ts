@@ -50,6 +50,8 @@ describe('S02 suspended-business eligibility (unit)', () => {
       suspendedBusinessRepo() as never,
       {} as never,
       {} as never,
+      {} as never,
+      {} as never,
     );
     await expect(
       service.create(

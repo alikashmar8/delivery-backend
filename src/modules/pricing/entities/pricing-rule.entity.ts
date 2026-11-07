@@ -1,5 +1,7 @@
+import type { DeliveryFinancialSnapshot } from '../../finance/entities/delivery-financial-snapshot.entity';
 import {
   Column,
+  OneToMany,
   CreateDateColumn,
   Entity,
   JoinColumn,
@@ -78,4 +80,11 @@ export class PricingRule {
 
   @UpdateDateColumn({ type: 'timestamptz', name: 'updatedAt' })
   updatedAt!: Date;
+
+  @OneToMany(
+    'DeliveryFinancialSnapshot',
+    (snapshot: DeliveryFinancialSnapshot) => snapshot.pricingRule,
+    { persistence: false },
+  )
+  financialSnapshots?: Relation<DeliveryFinancialSnapshot[]>;
 }

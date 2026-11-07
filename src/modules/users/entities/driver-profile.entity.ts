@@ -1,3 +1,4 @@
+import type { LedgerEntry } from '../../finance/entities/ledger-entry.entity';
 import type { Relation } from 'typeorm';
 import {
   Column,
@@ -10,6 +11,7 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import type { Delivery } from '../../deliveries/entities/delivery.entity';
+import type { DriverPlanAssignment } from '../../finance/entities/driver-plan-assignment.entity';
 import type { User } from './user.entity';
 
 export enum DriverAvailability {
@@ -62,8 +64,13 @@ export class DriverProfile {
   })
   rating!: number;
 
-  @Column({ type: 'boolean', default: true })
+  /** New driver profiles require explicit operational approval. */
+  @Column({ type: 'boolean', default: false })
   active!: boolean;
+
+  /** Strict expected-version precondition for approval and availability writes. */
+  @Column({ type: 'integer', default: 1 })
+  version!: number;
 
   @Column({ type: 'bigint', default: 0 })
   balance!: string;
@@ -81,4 +88,16 @@ export class DriverProfile {
     persistence: false,
   })
   deliveries?: Relation<Delivery[]>;
+
+  @OneToMany(
+    'DriverPlanAssignment',
+    (assignment: DriverPlanAssignment) => assignment.driver,
+    { persistence: false },
+  )
+  planAssignments?: Relation<DriverPlanAssignment[]>;
+
+  @OneToMany('LedgerEntry', (entry: LedgerEntry) => entry.driver, {
+    persistence: false,
+  })
+  ledgerEntries?: Relation<LedgerEntry[]>;
 }

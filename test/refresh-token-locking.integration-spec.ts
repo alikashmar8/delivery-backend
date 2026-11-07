@@ -1,3 +1,8 @@
+import { AddPricedSnapshots1700000000015 } from '../src/database/migrations/1700000000015-AddPricedSnapshots';
+import { DeliveryFinancialSnapshot } from '../src/modules/finance/entities/delivery-financial-snapshot.entity';
+import { AddImmutableLedger1700000000014 } from '../src/database/migrations/1700000000014-AddImmutableLedger';
+import { LedgerEntry } from '../src/modules/finance/entities/ledger-entry.entity';
+import { LedgerEvent } from '../src/modules/finance/entities/ledger-event.entity';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
@@ -10,6 +15,12 @@ import { SeedLebanonRegions1700000000004 } from '../src/database/migrations/1700
 import { CreateDeliveryCore1700000000005 } from '../src/database/migrations/1700000000005-CreateDeliveryCore';
 import { StabilizePhasesZeroToFour1700000000006 } from '../src/database/migrations/1700000000006-StabilizePhasesZeroToFour';
 import { UseCamelCaseColumns1700000000007 } from '../src/database/migrations/1700000000007-UseCamelCaseColumns';
+import { CreateIdempotencyTable1700000000008 } from '../src/database/migrations/1700000000008-CreateIdempotencyTable';
+import { CreateAuditTable1700000000009 } from '../src/database/migrations/1700000000009-CreateAuditTable';
+import { AddDeliveryPricingProvenance1700000000010 } from '../src/database/migrations/1700000000010-AddDeliveryPricingProvenance';
+import { EnforceUniqueAdminRoleAssignments1700000000011 } from '../src/database/migrations/1700000000011-EnforceUniqueAdminRoleAssignments';
+import { AddDriverCapabilityLifecycle1700000000012 } from '../src/database/migrations/1700000000012-AddDriverCapabilityLifecycle';
+import { AddDriverCompensationPlans1700000000013 } from '../src/database/migrations/1700000000013-AddDriverCompensationPlans';
 import { Address } from '../src/modules/addresses/entities/address.entity';
 import { AuthService } from '../src/modules/auth/auth.service';
 import { MemoryOtpProvider } from '../src/modules/auth/otp/otp-provider';
@@ -23,6 +34,8 @@ import { Recipient } from '../src/modules/deliveries/entities/recipient.entity';
 import { PricingRule } from '../src/modules/pricing/entities/pricing-rule.entity';
 import { Region } from '../src/modules/regions/entities/region.entity';
 import { AdminRoleAssignment } from '../src/modules/users/entities/admin-role-assignment.entity';
+import { DriverCompensationPlan } from '../src/modules/finance/entities/driver-compensation-plan.entity';
+import { DriverPlanAssignment } from '../src/modules/finance/entities/driver-plan-assignment.entity';
 import { DriverProfile } from '../src/modules/users/entities/driver-profile.entity';
 import { RefreshToken } from '../src/modules/users/entities/refresh-token.entity';
 import { User, UserStatus } from '../src/modules/users/entities/user.entity';
@@ -32,6 +45,11 @@ import { createPostgisDatabase } from './helpers/postgis-database';
 const entities = [
   User,
   DriverProfile,
+  DriverCompensationPlan,
+  DriverPlanAssignment,
+  LedgerEntry,
+  LedgerEvent,
+  DeliveryFinancialSnapshot,
   AdminRoleAssignment,
   RefreshToken,
   Business,
@@ -55,6 +73,14 @@ const migrations = [
   CreateDeliveryCore1700000000005,
   StabilizePhasesZeroToFour1700000000006,
   UseCamelCaseColumns1700000000007,
+  CreateIdempotencyTable1700000000008,
+  CreateAuditTable1700000000009,
+  AddDeliveryPricingProvenance1700000000010,
+  EnforceUniqueAdminRoleAssignments1700000000011,
+  AddDriverCapabilityLifecycle1700000000012,
+  AddDriverCompensationPlans1700000000013,
+  AddImmutableLedger1700000000014,
+  AddPricedSnapshots1700000000015,
 ];
 
 function fakeConfig(): ConfigService {

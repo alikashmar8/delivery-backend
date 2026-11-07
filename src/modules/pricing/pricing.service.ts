@@ -72,6 +72,8 @@ export class PricingService {
     dto: CreatePricingRuleDto,
     auditContext?: AuditRequestContext,
   ): Promise<PricingRule> {
+    if (dto.currency && dto.currency !== 'USD')
+      throw new BadRequestException('Only USD is supported');
     const businessId = dto.businessId ?? null;
     if (businessId) await this.assertBusinessActive(businessId);
     await this.assertCanManage(actorUserId, businessId);
@@ -158,6 +160,8 @@ export class PricingService {
     auditContext?: AuditRequestContext,
   ): Promise<PricingRule> {
     const rule = await this.findById(id);
+    if (dto.currency && dto.currency !== 'USD')
+      throw new BadRequestException('Only USD is supported');
     if (rule.businessId) await this.assertBusinessActive(rule.businessId);
     await this.assertCanManage(actorUserId, rule.businessId);
     this.validateMoneyFields(dto);
@@ -272,6 +276,8 @@ export class PricingService {
     await this.assertZoneCompatible(params.zoneId ?? null, businessId);
 
     const currency = params.currency ?? 'USD';
+    if (currency !== 'USD')
+      throw new BadRequestException('Only USD is supported');
     const now = new Date();
     const query = this.repo
       .createQueryBuilder('rule')

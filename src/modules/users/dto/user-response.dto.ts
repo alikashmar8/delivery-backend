@@ -1,20 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { DriverProfile } from '../entities/driver-profile.entity';
+import { DriverProfileResponseDto } from './driver-response.dto';
 import { User } from '../entities/user.entity';
-
-export class DriverProfileResponseDto {
-  @ApiProperty({ format: 'uuid' })
-  id!: string;
-
-  @ApiProperty()
-  vehicleType!: string;
-
-  @ApiProperty()
-  availability!: string;
-
-  @ApiProperty()
-  active!: boolean;
-}
 
 export class AuthenticatedUserResponseDto {
   @ApiProperty({ format: 'uuid' })
@@ -74,9 +61,14 @@ export function toUserSummaryResponse(
     driverProfile: driverProfile
       ? {
           id: driverProfile.id,
+          userId: driverProfile.userId,
           vehicleType: driverProfile.vehicleType,
+          vehiclePlate: driverProfile.vehiclePlate,
           availability: driverProfile.availability,
           active: driverProfile.active,
+          version: driverProfile.version,
+          createdAt: driverProfile.createdAt,
+          updatedAt: driverProfile.updatedAt,
         }
       : null,
   };

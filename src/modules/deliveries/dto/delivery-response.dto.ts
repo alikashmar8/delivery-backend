@@ -70,7 +70,7 @@ export class DeliveryResponseDto extends DeliverySummaryResponseDto {
   pickedUpAt!: Date | null;
   @ApiProperty({ type: String, format: 'date-time', nullable: true })
   deliveredAt!: Date | null;
-  @ApiProperty({ format: 'uuid', nullable: true })
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
   pricingRuleId!: string | null;
   @ApiProperty({
     type: Number,
