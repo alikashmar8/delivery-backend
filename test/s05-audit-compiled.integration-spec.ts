@@ -6,11 +6,16 @@ import { LedgerEvent } from '../src/modules/finance/entities/ledger-event.entity
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+} from 'node:http';
 import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { setTimeout } from 'node:timers/promises';
 import { hash } from 'argon2';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { PASSWORD_IP_LIMIT } from '../src/modules/auth/auth.service';
 import { InitExtensionsAndEnums1700000000000 } from '../src/database/migrations/1700000000000-InitExtensionsAndEnums';
 import { CreateIdentityTables1700000000001 } from '../src/database/migrations/1700000000001-CreateIdentityTables';
 import { CreateBusinessTables1700000000002 } from '../src/database/migrations/1700000000002-CreateBusinessTables';
@@ -47,6 +52,7 @@ import { RefreshToken } from '../src/modules/users/entities/refresh-token.entity
 import { User } from '../src/modules/users/entities/user.entity';
 import { DeliveryZone } from '../src/modules/zones/entities/delivery-zone.entity';
 import { createPostgisDatabase } from './helpers/postgis-database';
+import { createEphemeralRedis } from './helpers/redis-container';
 
 const entities = [
   User,
@@ -92,6 +98,7 @@ const migrations = [
 
 describe('S05 audit through the compiled entrypoint', () => {
   let database: Awaited<ReturnType<typeof createPostgisDatabase>>;
+  let redis: Awaited<ReturnType<typeof createEphemeralRedis>>;
   let child: ReturnType<typeof spawn> | undefined;
   let exited: Promise<unknown> | undefined;
   let baseUrl: string;
@@ -101,6 +108,7 @@ describe('S05 audit through the compiled entrypoint', () => {
 
   beforeAll(async () => {
     database = await createPostgisDatabase(entities, migrations);
+    redis = await createEphemeralRedis();
     const source = database.dataSource;
     const user = await source.getRepository(User).save({
       phone: '+96171060001',
@@ -126,7 +134,12 @@ describe('S05 audit through the compiled entrypoint', () => {
 
   afterAll(async () => {
     await stopCompiledApp();
+    if (redis) await redis.close();
     if (database) await database.close();
+  });
+
+  beforeEach(async () => {
+    await redis.client.flushdb();
   });
 
   async function allocatePort(): Promise<number> {
@@ -151,7 +164,9 @@ describe('S05 audit through the compiled entrypoint', () => {
         APP_HOST: '127.0.0.1',
         APP_PORT: String(port),
         CORS_ORIGINS: 'http://localhost:5173',
-        OTP_STATE: 'memory',
+        OTP_STATE: 'redis',
+        REDIS_HOST: '127.0.0.1',
+        REDIS_PORT: String(redis.client.options.port),
         DB_HOST: connection.host,
         DB_PORT: String(connection.port),
         DB_USER: connection.username,
@@ -197,7 +212,9 @@ describe('S05 audit through the compiled entrypoint', () => {
   }
 
   it('captures audit metadata and correlated conflict responses', async () => {
-    const protectedResponse = await fetch(`${baseUrl}/users/me`);
+    const protectedResponse = await fetch(`${baseUrl}/users/me`, {
+      headers: { 'X-Forwarded-For': '10.1.2.3' },
+    });
     expect(protectedResponse.status).toBe(401);
 
     const login = await fetch(`${baseUrl}/auth/login/password`, {
@@ -214,6 +231,9 @@ describe('S05 audit through the compiled entrypoint', () => {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
         'User-Agent': 's05-compiled-client/1.0',
+        'X-Forwarded-For': '203.0.113.99, 10.1.2.3',
+        Forwarded: 'for=203.0.113.99',
+        'X-Real-IP': '203.0.113.99',
       },
       body: JSON.stringify({ baseFee: '500', currency: 'USD' }),
     });
@@ -224,7 +244,7 @@ describe('S05 audit through the compiled entrypoint', () => {
       .findOneOrFail({
         where: { action: 'pricing.create', entityId: pricingBody.id },
       });
-    expect(audit.ipAddress).toBeTruthy();
+    expect(audit.ipAddress).toBe('127.0.0.1');
     expect(audit.userAgent).toBe('s05-compiled-client/1.0');
 
     const business = await fetch(`${baseUrl}/businesses`, {
@@ -293,5 +313,87 @@ describe('S05 audit through the compiled entrypoint', () => {
         (entry) => entry.userAgent === 's05-compiled-role-client/1.0',
       ),
     ).toBe(true);
+  });
+
+  it('cannot rotate forwarded headers to bypass the Redis per-IP password limit', async () => {
+    for (let attempt = 0; attempt <= PASSWORD_IP_LIMIT; attempt += 1) {
+      const response = await fetch(`${baseUrl}/auth/login/password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': `198.51.100.${attempt + 1}`,
+        },
+        // Different unknown accounts avoid the separate per-email limit.
+        body: JSON.stringify({
+          email: `proxy-limit-${attempt}@example.test`,
+          password,
+        }),
+      });
+      expect(response.status).toBe(attempt < PASSWORD_IP_LIMIT ? 401 : 429);
+    }
+  });
+
+  it('preserves auth and audit through a real local reverse proxy with trust disabled', async () => {
+    const proxy = createHttpServer((incoming, outgoing) => {
+      const upstream = httpRequest(
+        `${baseUrl}${incoming.url}`,
+        {
+          method: incoming.method,
+          headers: {
+            ...incoming.headers,
+            'x-forwarded-for': '203.0.113.99, 198.51.100.23',
+          },
+        },
+        (response) => {
+          outgoing.writeHead(response.statusCode!, response.headers);
+          response.pipe(outgoing);
+        },
+      );
+      upstream.on('error', () => outgoing.writeHead(502).end());
+      incoming.pipe(upstream);
+    });
+    proxy.listen(0, '127.0.0.1');
+    await once(proxy, 'listening');
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+    try {
+      expect((await fetch(`${proxyUrl}/users/me`)).status).toBe(401);
+      const login = await fetch(`${proxyUrl}/auth/login/password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      expect(login.status).toBe(200);
+      const { accessToken } = (await login.json()) as { accessToken: string };
+      const headers = {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      };
+      expect((await fetch(`${proxyUrl}/users/me`, { headers })).status).toBe(
+        200,
+      );
+      const invalid = await fetch(`${proxyUrl}/pricing-rules`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ baseFee: '-1' }),
+      });
+      expect(invalid.status).toBe(400);
+      const pricing = await fetch(`${proxyUrl}/pricing-rules`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ baseFee: '500', currency: 'USD' }),
+      });
+      expect(pricing.status).toBe(201);
+      const { id } = (await pricing.json()) as { id: string };
+      const audit = await database.dataSource
+        .getRepository(AuditLog)
+        .findOneOrFail({
+          where: { action: 'pricing.create', entityId: id },
+        });
+      expect(audit.ipAddress).toBe('127.0.0.1');
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        proxy.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
   });
 });
