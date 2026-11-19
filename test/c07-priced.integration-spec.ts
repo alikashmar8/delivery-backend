@@ -1,3 +1,10 @@
+import { request as httpRequest } from 'node:http';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { AddDeliveryEvidenceAndCompletion1700000000018 } from '../src/database/migrations/1700000000018-AddDeliveryEvidenceAndCompletion';
+import { createS3Storage } from './helpers/s3-storage';
+import sharp from 'sharp';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { AllowUnassignedEarningReplacement1700000000016 } from '../src/database/migrations/1700000000016-AllowUnassignedEarningReplacement';
 import { EnforceMethodCollectableAmount1700000000017 } from '../src/database/migrations/1700000000017-EnforceMethodCollectableAmount';
 import { IsNull } from 'typeorm';
@@ -96,6 +103,7 @@ const migrations = [
   AddPricedSnapshots1700000000015,
   AllowUnassignedEarningReplacement1700000000016,
   EnforceMethodCollectableAmount1700000000017,
+  AddDeliveryEvidenceAndCompletion1700000000018,
 ];
 
 describe('C07/D01 commercial lifecycle through the compiled API and real PostgreSQL', () => {
@@ -103,6 +111,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
   let child: ReturnType<typeof spawn> | undefined;
   let exited: Promise<unknown> | undefined;
   let baseUrl: string;
+  let storage: Awaited<ReturnType<typeof createS3Storage>>;
   let runtimeErrors = '';
   const password = 'c07-test-password';
   let admin: User;
@@ -115,6 +124,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
   let phoneSequence = 100;
 
   beforeAll(async () => {
+    storage = await createS3Storage();
     database = await createPostgisDatabase(entities, migrations);
     const passwordHash = await hash(password);
     const users = database.dataSource.getRepository(User);
@@ -186,6 +196,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
   afterAll(async () => {
     await stopCompiledApp();
     if (database) await database.close();
+    if (storage) await storage.close();
   });
   async function allocatePort(): Promise<number> {
     const server = createServer();
@@ -210,6 +221,11 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
         APP_PORT: String(port),
         CORS_ORIGINS: 'http://localhost:5173',
         OTP_STATE: 'memory',
+        POD_S3_BUCKET: storage.bucket,
+        POD_S3_REGION: 'us-east-1',
+        POD_S3_ENDPOINT: storage.endpoint,
+        AWS_ACCESS_KEY_ID: storage.accessKeyId,
+        AWS_SECRET_ACCESS_KEY: storage.secretAccessKey,
         DB_HOST: connection.host,
         DB_PORT: String(connection.port),
         DB_USER: connection.username,
@@ -304,6 +320,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
     method = 'cod',
     codAmount = '10000',
     key?: string,
+    newPolicy = false,
   ) {
     const response = await request(baseUrl)
       .post('/deliveries')
@@ -324,6 +341,13 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
         },
       })
       .expect(201);
+    // Reconstruct the prior-policy fixture for C07/D01 historical regressions.
+    // D02 cases keep the public creation policy and exercise the current journey.
+    if (!newPolicy)
+      await database.dataSource.query(
+        `UPDATE deliveries SET "feeBreakdown" = "feeBreakdown" - 'recognitionPolicy' WHERE id = $1`,
+        [response.body.id],
+      );
     return response.body as {
       id: string;
       version: number;
@@ -421,7 +445,9 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
     const prior = await createPostgisDatabase(
       entities,
       migrations.filter(
-        (m) => m !== EnforceMethodCollectableAmount1700000000017,
+        (m) =>
+          m !== EnforceMethodCollectableAmount1700000000017 &&
+          m !== AddDeliveryEvidenceAndCompletion1700000000018,
       ),
     );
     try {
@@ -506,6 +532,18 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
           [prepaid.id],
         ),
       ).rejects.toMatchObject({ code: '23514' });
+      const evidenceMigration =
+        new AddDeliveryEvidenceAndCompletion1700000000018();
+      for (const direction of ['up', 'down', 'up', 'down'] as const) {
+        await source.transaction(
+          async (manager) =>
+            await evidenceMigration[direction](manager.queryRunner!),
+        );
+        expect(await repo.findOneByOrFail({ id: original.id })).toEqual(
+          original,
+        );
+        expect(await repo.findOneByOrFail({ id: prepaid.id })).toEqual(prepaid);
+      }
     } finally {
       await prior.close();
     }
@@ -998,6 +1036,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
             AddPricedSnapshots1700000000015,
             AllowUnassignedEarningReplacement1700000000016,
             EnforceMethodCollectableAmount1700000000017,
+            AddDeliveryEvidenceAndCompletion1700000000018,
           ].includes(m),
       ),
     );
@@ -1078,6 +1117,9 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
       order: { id: 'ASC' },
       take: 10,
     });
+    const [currentGroupRule] = await source.query(
+      "SELECT pg_get_functiondef('validate_ledger_event_complete()'::regprocedure) definition",
+    );
     const migration = new AllowUnassignedEarningReplacement1700000000016();
     for (const direction of ['down', 'up', 'down', 'up'] as const) {
       await source.transaction(
@@ -1096,6 +1138,7 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
         }),
       ).toEqual(entries);
     }
+    await source.query(currentGroupRule.definition);
     const original = entries.find((e) => e.entryType === 'DRIVER_EARNING')!;
     const replacement = await freshDriver();
     await expect(
@@ -1718,5 +1761,931 @@ describe('C07/D01 commercial lifecycle through the compiled API and real Postgre
       .set('Idempotency-Key', cancelKey)
       .send({ expectedVersion: 4, reason: 'sender_request' })
       .expect(201);
+  });
+  async function newJourney(
+    method = 'cod',
+    codAmount = '10000',
+    businessId?: string,
+  ) {
+    const created = await freshDelivery(
+      businessId,
+      method,
+      codAmount,
+      undefined,
+      true,
+    );
+    const driver = await freshDriver();
+    const email = `d02-${randomUUID()}@example.test`;
+    await database.dataSource
+      .getRepository(User)
+      .update(driver.user.id, { email, passwordHash: await hash(password) });
+    const token = await login(email);
+    const state = (await assign(created, driver.profile.id).expect(200)).body;
+    return { state, driver, token };
+  }
+  function action(
+    state: { id: string; version: number },
+    token: string,
+    toStatus: string,
+    extra = {},
+    key?: string,
+  ) {
+    const call = request(baseUrl)
+      .post(`/deliveries/${state.id}/actions`)
+      .auth(token, { type: 'bearer' })
+      .send({ toStatus, expectedVersion: state.version, ...extra });
+    if (key) call.set('Idempotency-Key', key);
+    return call;
+  }
+  function payment(
+    state: { id: string; version: number },
+    token: string,
+    amount: string,
+    receiptId = randomUUID(),
+  ) {
+    return request(baseUrl)
+      .post(`/deliveries/${state.id}/payments`)
+      .auth(token, { type: 'bearer' })
+      .send({ receiptId, amount, expectedVersion: state.version });
+  }
+  async function arrive(state: { id: string; version: number }, token: string) {
+    let current = state;
+    for (const to of ['ACCEPTED', 'PICKED_UP', 'IN_TRANSIT', 'ARRIVED'])
+      current = (await action(current, token, to).expect(200)).body;
+    return current;
+  }
+  async function photo(
+    state: { id: string; version: number },
+    token: string,
+    bytes?: Uint8Array,
+  ) {
+    const uploadId = randomUUID();
+    const upload = (
+      await request(baseUrl)
+        .post(`/deliveries/${state.id}/pod-uploads`)
+        .auth(token, { type: 'bearer' })
+        .send({
+          uploadId,
+          expectedVersion: state.version,
+          contentType: 'image/png',
+        })
+        .expect(200)
+    ).body;
+    const png =
+      bytes ??
+      (await sharp({
+        create: { width: 2, height: 2, channels: 3, background: '#336699' },
+      })
+        .png()
+        .toBuffer());
+    const form = new FormData();
+    for (const [key, value] of Object.entries(upload.fields))
+      form.append(key, value as string);
+    form.append(
+      'file',
+      new Blob([new Uint8Array(png)], { type: 'image/png' }),
+      'pod.png',
+    );
+    expect(
+      (await fetch(upload.url, { method: 'POST', body: form })).status,
+    ).toBe(204);
+    return { uploadId, upload, png };
+  }
+
+  it('D02 separates partial cash, physical DELIVERED and final COMPLETED with immutable versioned real-storage POD', async () => {
+    const journey = await newJourney();
+    const { token, driver } = journey;
+    let state = journey.state;
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: state.id }),
+    ).toBe(0);
+    const receiptId = randomUUID();
+    const initial = state;
+    const paid = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        payment(initial, token, '6000', receiptId),
+      ),
+    );
+    expect(
+      paid.map((r) => r.status),
+      runtimeErrors + JSON.stringify(paid[0].body),
+    ).toEqual(Array(8).fill(200));
+    state = paid[0].body;
+    expect(state.status).toBe('ASSIGNED');
+    expect(new Date(state.updatedAt).toISOString()).toBe(
+      (
+        await database.dataSource
+          .getRepository(Delivery)
+          .findOneByOrFail({ id: state.id })
+      ).updatedAt.toISOString(),
+    );
+    expect(
+      (
+        await database.dataSource.query(
+          'SELECT amount,"principalAmount","feeAmount" FROM delivery_payments WHERE id=$1',
+          [receiptId],
+        )
+      )[0],
+    ).toMatchObject({
+      amount: '6000',
+      principalAmount: '6000',
+      feeAmount: '0',
+    });
+    await payment(initial, token, '6001', receiptId).expect(409);
+    await payment(initial, token, '1').expect(409);
+    state = await arrive(state, token);
+    await action(state, token, 'DELIVERED').expect(400);
+    const { uploadId, upload, png } = await photo(state, token);
+    const objectKey = upload.fields.key as string;
+    expect(
+      (await fetch(`${storage.endpoint}/${storage.bucket}/${objectKey}`))
+        .status,
+    ).toBe(403);
+    state = (
+      await action(
+        state,
+        token,
+        'DELIVERED',
+        { uploadId },
+        randomUUID(),
+      ).expect(200)
+    ).body;
+    expect(state.status).toBe('DELIVERED');
+    expect(state.deliveredAt).toBeTruthy();
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: state.id, entryType: 'DRIVER_EARNING' }),
+    ).toBe(0);
+    expect(
+      await database.dataSource
+        .getRepository(DriverProfile)
+        .findOneBy({ id: driver.profile.id }),
+    ).toMatchObject({ availability: 'online' });
+    const summary = (
+      await request(baseUrl)
+        .get(`/deliveries/${state.id}/payment-summary`)
+        .auth(token, { type: 'bearer' })
+        .expect(200)
+    ).body;
+    expect(summary).toEqual({
+      expectedAmount: '10500',
+      paidAmount: '6000',
+      outstandingAmount: '4500',
+    });
+    const source = database.dataSource;
+    const [proof] = await source.query(
+      'SELECT * FROM proofs_of_delivery WHERE "deliveryId"=$1',
+      [state.id],
+    );
+    await storage.client.send(
+      new PutObjectCommand({
+        Bucket: storage.bucket,
+        Key: objectKey,
+        ContentType: 'image/png',
+        Body: await sharp({
+          create: { width: 3, height: 3, channels: 3, background: '#ff0000' },
+        })
+          .png()
+          .toBuffer(),
+      }),
+    );
+    const link = (
+      await request(baseUrl)
+        .get(`/deliveries/${state.id}/proof`)
+        .auth(token, { type: 'bearer' })
+        .expect(200)
+    ).body;
+    expect(Buffer.from(await (await fetch(link.url)).arrayBuffer())).toEqual(
+      Buffer.from(png),
+    );
+    expect(proof.objectVersion).toBeTruthy();
+    const shortLink = await getSignedUrl(
+      storage.client,
+      new GetObjectCommand({
+        Bucket: storage.bucket,
+        Key: objectKey,
+        VersionId: proof.objectVersion,
+      }),
+      { expiresIn: 1 },
+    );
+    await setTimeout(1300);
+    expect((await fetch(shortLink)).status).toBe(403);
+    const newerJob = await freshDelivery(
+      undefined,
+      'cod',
+      '10000',
+      undefined,
+      true,
+    );
+    await assign(newerJob, driver.profile.id).expect(200);
+    const lastId = randomUUID();
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () => payment(state, token, '4500', lastId)),
+    );
+    expect(
+      responses.map((r) => r.status),
+      runtimeErrors + JSON.stringify(responses[0].body),
+    ).toEqual(Array(8).fill(200));
+    const completed = responses[0].body;
+    expect(completed.status).toBe('COMPLETED');
+    expect(
+      await source
+        .getRepository(DriverProfile)
+        .findOneBy({ id: driver.profile.id }),
+    ).toMatchObject({ availability: 'on_delivery' });
+    expect(
+      await source
+        .getRepository(AuditLog)
+        .countBy({ entityId: state.id, action: 'delivery.payment' }),
+    ).toBe(2);
+    expect(
+      (
+        await source.query(
+          'SELECT "principalAmount","feeAmount" FROM delivery_payments WHERE id=$1',
+          [lastId],
+        )
+      )[0],
+    ).toMatchObject({ principalAmount: '4000', feeAmount: '500' });
+    expect(
+      await source
+        .getRepository(LedgerEvent)
+        .countBy({ kind: 'completion', sourceId: state.id }),
+    ).toBe(1);
+    const entries = await source
+      .getRepository(LedgerEntry)
+      .find({ where: { deliveryId: state.id }, take: 20 });
+    expect(
+      entries
+        .filter((e) => e.entryType === 'DRIVER_EARNING')
+        .map((e) => e.amount),
+    ).toEqual(['400']);
+    expect(
+      entries
+        .filter((e) => e.entryType === 'COD_PAYABLE')
+        .map((e) => e.amount)
+        .sort(),
+    ).toEqual(['4000', '6000']);
+    const versions = await source.getRepository(DeliveryStatusHistory).find({
+      where: { deliveryId: state.id },
+      take: 20,
+      order: { occurredAt: 'ASC' },
+    });
+    expect(versions.filter((h) => h.toStatus === 'COMPLETED')).toHaveLength(1);
+    await stopCompiledApp();
+    await startCompiledApp();
+    await payment(state, token, '4500', lastId).expect(200);
+    await payment(completed, token, '1').expect(409);
+    for (const table of [
+      'delivery_payments',
+      'proofs_of_delivery',
+      'delivery_attempts',
+      'pod_uploads',
+    ])
+      await expect(source.query(`TRUNCATE ${table} CASCADE`)).rejects.toThrow(
+        'Ledger history is immutable',
+      );
+    await expect(
+      source.query('UPDATE delivery_payments SET amount=amount WHERE id=$1', [
+        lastId,
+      ]),
+    ).rejects.toThrow('Ledger history is immutable');
+  });
+
+  it('D02 accepts full prepayment without claiming delivery and completes only after physical POD, including zero cash methods', async () => {
+    for (const method of ['cod', 'prepaid', 'account']) {
+      const { state: initial, token } = await newJourney(method, '0');
+      let state = initial;
+      if (method === 'cod') {
+        state = (await payment(state, token, '500').expect(200)).body;
+        expect(state.status).toBe('ASSIGNED');
+      } else await payment(state, token, '1').expect(400);
+      state = await arrive(state, token);
+      const { uploadId } = await photo(state, token);
+      const complete = (
+        await action(state, token, 'DELIVERED', { uploadId }).expect(200)
+      ).body;
+      expect(complete.status).toBe('COMPLETED');
+      expect(
+        await database.dataSource
+          .getRepository(LedgerEntry)
+          .countBy({ deliveryId: state.id, entryType: 'COD_COLLECTED' }),
+      ).toBe(0);
+      expect(
+        await database.dataSource
+          .getRepository(LedgerEvent)
+          .countBy({ kind: 'completion', sourceId: state.id }),
+      ).toBe(1);
+    }
+  });
+
+  it('D02 preserves quotes across failed attempts/retry and requires return evidence without earning money', async () => {
+    const { state: initial, token } = await newJourney();
+    let state = initial;
+    state = (await action(state, token, 'ACCEPTED').expect(200)).body;
+    state = (await action(state, token, 'PICKED_UP').expect(200)).body;
+    await action(state, token, 'FAILED').expect(400);
+    await action(state, token, 'FAILED', { reasonCode: 'other' }).expect(400);
+    const key = randomUUID();
+    const failures = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        action(state, token, 'FAILED', { reasonCode: 'not_answered' }, key),
+      ),
+    );
+    expect(failures.map((r) => r.status)).toEqual(Array(8).fill(200));
+    state = failures[0].body;
+    expect(
+      (
+        await database.dataSource.query(
+          'SELECT count(*)::int count FROM delivery_attempts WHERE "deliveryId"=$1',
+          [state.id],
+        )
+      )[0].count,
+    ).toBe(1);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: state.id }),
+    ).toBe(0);
+    state = (
+      await request(baseUrl)
+        .post(`/deliveries/${state.id}/transition`)
+        .auth(adminToken, { type: 'bearer' })
+        .send({
+          toStatus: 'RESCHEDULED',
+          expectedVersion: state.version,
+          reason: 'recipient_requested',
+          scheduledAt: new Date(Date.now() + 3600000).toISOString(),
+        })
+        .expect(200)
+    ).body;
+    state = (await action(state, token, 'IN_TRANSIT').expect(200)).body;
+    state = (
+      await action(state, token, 'FAILED', { reasonCode: 'refused' }).expect(
+        200,
+      )
+    ).body;
+    await action(state, token, 'RETURNED', { returnConfirmed: false }).expect(
+      400,
+    );
+    state = (
+      await action(state, token, 'RETURNED', { returnConfirmed: true }).expect(
+        200,
+      )
+    ).body;
+    expect(state.status).toBe('RETURNED');
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: state.id }),
+    ).toBe(0);
+    await payment(state, token, '100').expect(409);
+  });
+
+  it('D02 denies foreign actors, invalid/overpayments and rolls back receipt/ledger/audit changes atomically', async () => {
+    const { state, token } = await newJourney();
+    for (const foreign of [senderToken, supportToken]) {
+      await action(state, foreign, 'ACCEPTED').expect(403);
+      await payment(state, foreign, '100').expect(403);
+      await request(baseUrl)
+        .post(`/deliveries/${state.id}/pod-uploads`)
+        .auth(foreign, { type: 'bearer' })
+        .send({
+          uploadId: randomUUID(),
+          contentType: 'image/png',
+          expectedVersion: state.version,
+        })
+        .expect(403);
+    }
+    await payment(state, token, '0').expect(400);
+    await payment(state, token, '10501').expect(400);
+    const source = database.dataSource;
+    const receiptId = randomUUID();
+    await source.query(
+      `CREATE FUNCTION d02_audit_fail() RETURNS trigger AS $$ BEGIN IF NEW.action='delivery.payment' THEN RAISE EXCEPTION 'injected audit failure'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TRIGGER d02_audit_fail BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION d02_audit_fail()`,
+    );
+    try {
+      await payment(state, token, '100', receiptId).expect(500);
+      expect(
+        (
+          await source.query(
+            'SELECT count(*)::int count FROM delivery_payments WHERE id=$1',
+            [receiptId],
+          )
+        )[0].count,
+      ).toBe(0);
+      expect(
+        await source
+          .getRepository(LedgerEvent)
+          .countBy({ kind: 'receipt', sourceId: receiptId }),
+      ).toBe(0);
+      expect(
+        (await source.getRepository(Delivery).findOneByOrFail({ id: state.id }))
+          .version,
+      ).toBe(state.version);
+    } finally {
+      await source.query(
+        'DROP TRIGGER d02_audit_fail ON audit_logs; DROP FUNCTION d02_audit_fail()',
+      );
+    }
+    const paid = (
+      await payment(state, adminToken, '100', receiptId).expect(200)
+    ).body;
+    await request(baseUrl)
+      .post(`/deliveries/${state.id}/cancel`)
+      .auth(senderToken, { type: 'bearer' })
+      .send({ expectedVersion: paid.version, reason: 'sender_request' })
+      .expect(409);
+    const first = await action(paid, token, 'ACCEPTED').expect(200);
+    const next = (await action(first.body, token, 'PICKED_UP').expect(200))
+      .body;
+    const invalid = await photo(
+      next,
+      token,
+      new TextEncoder().encode('not an image'),
+    );
+    let arrived = (await action(next, token, 'IN_TRANSIT').expect(200)).body;
+    arrived = (await action(arrived, token, 'ARRIVED').expect(200)).body;
+    await action(arrived, token, 'DELIVERED', {
+      uploadId: invalid.uploadId,
+    }).expect(400);
+    expect(
+      (
+        await source.query(
+          'SELECT count(*)::int count FROM proofs_of_delivery WHERE "deliveryId"=$1',
+          [state.id],
+        )
+      )[0].count,
+    ).toBe(0);
+    const goodPhoto = await photo(arrived, token);
+    const delivered = (
+      await action(arrived, token, 'DELIVERED', {
+        uploadId: goodPhoto.uploadId,
+      }).expect(200)
+    ).body;
+    const finalReceipt = randomUUID();
+    await source.query(
+      `CREATE FUNCTION d02_final_audit_fail() RETURNS trigger AS $$ BEGIN IF NEW.action='delivery.payment' THEN RAISE EXCEPTION 'injected final audit failure'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TRIGGER d02_final_audit_fail BEFORE INSERT ON audit_logs FOR EACH ROW EXECUTE FUNCTION d02_final_audit_fail()`,
+    );
+    try {
+      await payment(delivered, token, '10400', finalReceipt).expect(500);
+      expect(
+        (await source.getRepository(Delivery).findOneByOrFail({ id: state.id }))
+          .status,
+      ).toBe('DELIVERED');
+      expect(
+        await source
+          .getRepository(LedgerEvent)
+          .countBy({ kind: 'completion', sourceId: state.id }),
+      ).toBe(0);
+      expect(
+        (
+          await source.query(
+            'SELECT count(*)::int count FROM delivery_payments WHERE id=$1',
+            [finalReceipt],
+          )
+        )[0].count,
+      ).toBe(0);
+    } finally {
+      await source.query(
+        'DROP TRIGGER d02_final_audit_fail ON audit_logs; DROP FUNCTION d02_final_audit_fail()',
+      );
+    }
+    await source.query(
+      `CREATE FUNCTION d02_deferred_fail() RETURNS trigger AS $$ BEGIN IF NEW.kind='completion' THEN RAISE EXCEPTION 'injected deferred completion failure' USING ERRCODE='23514'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE CONSTRAINT TRIGGER d02_deferred_fail AFTER INSERT ON ledger_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION d02_deferred_fail()`,
+    );
+    try {
+      await payment(delivered, token, '10400', finalReceipt).expect(400);
+      expect(
+        (await source.getRepository(Delivery).findOneByOrFail({ id: state.id }))
+          .status,
+      ).toBe('DELIVERED');
+      expect(
+        (
+          await source.query(
+            'SELECT count(*)::int count FROM delivery_payments WHERE id=$1',
+            [finalReceipt],
+          )
+        )[0].count,
+      ).toBe(0);
+    } finally {
+      await source.query(
+        'DROP TRIGGER d02_deferred_fail ON ledger_events; DROP FUNCTION d02_deferred_fail()',
+      );
+    }
+    expect(
+      (await payment(delivered, token, '10400', finalReceipt).expect(200)).body
+        .status,
+    ).toBe('COMPLETED');
+  });
+  it('D02 completes business receipts with exact large integers, denies foreign tenants and honors suspension', async () => {
+    const business = (
+      await request(baseUrl)
+        .post('/businesses')
+        .auth(senderToken, { type: 'bearer' })
+        .send({
+          name: 'D02 sender business',
+          slug: `d02-${randomUUID()}`,
+          contactPhone: '+96171089999',
+        })
+        .expect(201)
+    ).body;
+    const foreign = await newJourney();
+    await request(baseUrl)
+      .post('/businesses')
+      .auth(foreign.token, { type: 'bearer' })
+      .send({
+        name: 'Other tenant',
+        slug: `d02-other-${randomUUID()}`,
+        contactPhone: '+96171089998',
+      })
+      .expect(201);
+    for (const method of ['cod', 'prepaid', 'account']) {
+      const { state: initial, token } = await newJourney(
+        method,
+        '9007199254740993',
+        business.id,
+      );
+      await request(baseUrl)
+        .post(`/deliveries/${initial.id}/payments`)
+        .send({
+          receiptId: randomUUID(),
+          amount: '1',
+          expectedVersion: initial.version,
+        })
+        .expect(401);
+      await payment(initial, foreign.token, '1').expect(403);
+      for (const endpoint of [
+        'payments',
+        'attempts',
+        'payment-summary',
+        'proof',
+      ])
+        await request(baseUrl)
+          .get(`/deliveries/${initial.id}/${endpoint}`)
+          .auth(foreign.token, { type: 'bearer' })
+          .expect(404);
+      await database.dataSource
+        .getRepository(Business)
+        .update(business.id, { status: 'suspended' as Business['status'] });
+      await payment(initial, adminToken, '1').expect(403);
+      await action(initial, token, 'ACCEPTED').expect(403);
+      await database.dataSource
+        .getRepository(Business)
+        .update(business.id, { status: 'active' as Business['status'] });
+      const expected = (
+        9007199254740993n + (method === 'cod' ? 500n : 0n)
+      ).toString();
+      let state = (await payment(initial, token, expected).expect(200)).body;
+      expect(state.status).toBe('ASSIGNED');
+      state = await arrive(state, token);
+      const { uploadId } = await photo(state, token);
+      state = (
+        await action(state, token, 'DELIVERED', { uploadId }).expect(200)
+      ).body;
+      expect(state.status).toBe('COMPLETED');
+      const payable = await database.dataSource
+        .getRepository(LedgerEntry)
+        .findOneByOrFail({ deliveryId: state.id, entryType: 'COD_PAYABLE' });
+      expect(payable).toMatchObject({
+        amount: '9007199254740993',
+        beneficiaryType: 'business',
+        beneficiaryBusinessId: business.id,
+      });
+      const listing = (
+        await request(baseUrl)
+          .get(`/deliveries/${state.id}/payments?take=1&skip=0`)
+          .auth(senderToken, { type: 'bearer' })
+          .expect(200)
+      ).body;
+      expect(listing.items).toHaveLength(1);
+      await request(baseUrl)
+        .get(`/deliveries/${state.id}/payments?take=101`)
+        .auth(senderToken, { type: 'bearer' })
+        .expect(400);
+    }
+  });
+
+  it('D02 rejects competing overpayments, expired/missing/cross-delivery POD and preserves revoked ownership', async () => {
+    const first = await newJourney();
+    const { state: initial, token } = first;
+    const race = await Promise.all([
+      payment(initial, token, '7000'),
+      payment(initial, token, '7000'),
+    ]);
+    expect(race.map((r) => r.status).sort()).toEqual([200, 409]);
+    const paid = race.find((r) => r.status === 200)!.body;
+    expect(
+      (
+        await database.dataSource.query(
+          'SELECT sum(amount)::text amount FROM delivery_payments WHERE "deliveryId"=$1',
+          [initial.id],
+        )
+      )[0].amount,
+    ).toBe('7000');
+    await request(baseUrl)
+      .post(`/deliveries/${paid.id}/transition`)
+      .auth(adminToken, { type: 'bearer' })
+      .send({
+        toStatus: 'CREATED',
+        expectedVersion: paid.version,
+        reason: 'reassign',
+      })
+      .expect(409);
+    const revocable = await newJourney();
+    const key = randomUUID();
+    // Revocation is from ASSIGNED before driver acceptance; an old receipt/action identity grants no authority.
+    const released = (
+      await request(baseUrl)
+        .post(`/deliveries/${revocable.state.id}/transition`)
+        .auth(adminToken, { type: 'bearer' })
+        .send({
+          toStatus: 'CREATED',
+          expectedVersion: revocable.state.version,
+          reason: 'reassign',
+        })
+        .expect(200)
+    ).body;
+    await action(revocable.state, revocable.token, 'ACCEPTED', {}, key).expect(
+      403,
+    );
+    const replacement = await freshDriver();
+    await assign(released, replacement.profile.id).expect(200);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: released.id }),
+    ).toBe(0);
+    let arrived = await arrive(paid, token);
+    const expiredId = randomUUID();
+    await database.dataSource.query(
+      'INSERT INTO pod_uploads (id,"deliveryId","driverId","objectKey","contentType","expiresAt") VALUES ($1,$2,$3,$4,$5,$6)',
+      [
+        expiredId,
+        arrived.id,
+        first.driver.profile.id,
+        `pod/${arrived.id}/${expiredId}`,
+        'image/png',
+        new Date(Date.now() - 1000),
+      ],
+    );
+    await action(arrived, token, 'DELIVERED', { uploadId: expiredId }).expect(
+      400,
+    );
+    const missingId = randomUUID();
+    await request(baseUrl)
+      .post(`/deliveries/${arrived.id}/pod-uploads`)
+      .auth(token, { type: 'bearer' })
+      .send({
+        uploadId: missingId,
+        expectedVersion: arrived.version,
+        contentType: 'image/png',
+      })
+      .expect(200);
+    await action(arrived, token, 'DELIVERED', { uploadId: missingId }).expect(
+      400,
+    );
+    const another = await newJourney();
+    const otherArrived = await arrive(another.state, another.token);
+    const otherProof = await photo(otherArrived, another.token);
+    await action(arrived, token, 'DELIVERED', {
+      uploadId: otherProof.uploadId,
+    }).expect(400);
+    const oversized = await request(baseUrl)
+      .post(`/deliveries/${arrived.id}/pod-uploads`)
+      .auth(token, { type: 'bearer' })
+      .send({
+        uploadId: randomUUID(),
+        expectedVersion: arrived.version,
+        contentType: 'image/png',
+      })
+      .expect(200);
+    const form = new FormData();
+    for (const [name, value] of Object.entries(oversized.body.fields))
+      form.append(name, value as string);
+    form.append(
+      'file',
+      new Blob([new Uint8Array(5242881)], { type: 'image/png' }),
+      'too-large.png',
+    );
+    expect(
+      (await fetch(oversized.body.url, { method: 'POST', body: form })).status,
+    ).toBeGreaterThanOrEqual(400);
+    const migration = new AddDeliveryEvidenceAndCompletion1700000000018();
+    await expect(
+      database.dataSource.transaction(
+        async (manager) => await migration.down(manager.queryRunner!),
+      ),
+    ).rejects.toThrow('preserve immutable records');
+  });
+
+  it('D02 serializes final cash against physical POD handover and converges to one completion', async () => {
+    const journey = await newJourney();
+    const { token } = journey;
+    const paid = (await payment(journey.state, token, '6000').expect(200)).body;
+    const arrived = await arrive(paid, token);
+    const { uploadId } = await photo(arrived, token);
+    const receiptId = randomUUID();
+    const race = await Promise.all([
+      payment(arrived, token, '4500', receiptId),
+      action(arrived, token, 'DELIVERED', { uploadId }),
+    ]);
+    expect(race.map((r) => r.status).sort()).toEqual([200, 409]);
+    let current = (
+      await request(baseUrl)
+        .get(`/deliveries/${arrived.id}`)
+        .auth(token, { type: 'bearer' })
+        .expect(200)
+    ).body;
+    if (current.status === 'ARRIVED') {
+      current = (
+        await action(current, token, 'DELIVERED', { uploadId }).expect(200)
+      ).body;
+    } else {
+      expect(current.status).toBe('DELIVERED');
+      current = (await payment(current, token, '4500', receiptId).expect(200))
+        .body;
+    }
+    expect(current.status).toBe('COMPLETED');
+    expect(
+      (
+        await request(baseUrl)
+          .get(`/deliveries/${current.id}/payment-summary`)
+          .auth(token, { type: 'bearer' })
+          .expect(200)
+      ).body,
+    ).toEqual({
+      expectedAmount: '10500',
+      paidAmount: '10500',
+      outstandingAmount: '0',
+    });
+    expect(
+      (
+        await request(baseUrl)
+          .get(`/deliveries/${current.id}/payments?take=20&skip=0`)
+          .auth(token, { type: 'bearer' })
+          .expect(200)
+      ).body.items,
+    ).toHaveLength(2);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEvent)
+        .countBy({ kind: 'completion', sourceId: current.id }),
+    ).toBe(1);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: current.id, entryType: 'DRIVER_EARNING' }),
+    ).toBe(1);
+  });
+
+  it('D02 rejects stale unassignment and competing reassignment during physical completion', async () => {
+    const { state, token, driver } = await newJourney();
+    const arrived = await arrive(state, token);
+    const { uploadId } = await photo(arrived, token);
+    const replacement = await freshDriver();
+    const [handover, unassign, reassign] = await Promise.all([
+      action(arrived, token, 'DELIVERED', { uploadId }),
+      request(baseUrl)
+        .post(`/deliveries/${state.id}/transition`)
+        .auth(adminToken, { type: 'bearer' })
+        .send({
+          toStatus: 'CREATED',
+          expectedVersion: state.version,
+          reason: 'reassign',
+        }),
+      assign(arrived, replacement.profile.id),
+    ]);
+    expect(handover.status).toBe(200);
+    expect(unassign.status).toBe(409);
+    expect(reassign.status).toBe(409);
+    expect(handover.body).toMatchObject({
+      status: 'DELIVERED',
+      driverId: driver.profile.id,
+    });
+    const completed = (await payment(handover.body, token, '10500').expect(200))
+      .body;
+    expect(completed).toMatchObject({
+      status: 'COMPLETED',
+      driverId: driver.profile.id,
+    });
+    expect(
+      await database.dataSource
+        .getRepository(DeliveryFinancialSnapshot)
+        .countBy({ deliveryId: state.id }),
+    ).toBe(1);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEvent)
+        .countBy({ kind: 'completion', sourceId: state.id }),
+    ).toBe(1);
+    const earnings = await database.dataSource.getRepository(LedgerEntry).find({
+      where: { deliveryId: state.id, entryType: 'DRIVER_EARNING' },
+      take: 20,
+    });
+    expect(earnings).toHaveLength(1);
+    expect(earnings[0]).toMatchObject({
+      driverId: driver.profile.id,
+      amount: '400',
+    });
+  });
+
+  it('D02 rejects an interrupted storage transfer and reuses the same upload identity on retry', async () => {
+    const { state, token } = await newJourney();
+    const arrived = await arrive(state, token);
+    const uploadId = randomUUID();
+    const body = {
+      uploadId,
+      expectedVersion: arrived.version,
+      contentType: 'image/png',
+    };
+    const createUpload = () =>
+      request(baseUrl)
+        .post(`/deliveries/${arrived.id}/pod-uploads`)
+        .auth(token, { type: 'bearer' })
+        .send(body);
+    const upload = (await createUpload().expect(200)).body;
+    const png = await sharp({
+      create: {
+        width: 10,
+        height: 10,
+        channels: 3,
+        background: '#ffffff',
+      },
+    })
+      .png()
+      .toBuffer();
+    const form = new FormData();
+    for (const [key, value] of Object.entries(upload.fields))
+      form.append(key, value as string);
+    form.append(
+      'file',
+      new Blob([new Uint8Array(png)], { type: 'image/png' }),
+      'pod.png',
+    );
+    const encoded = new Request(upload.url, { method: 'POST', body: form });
+    const bytes = Buffer.from(await encoded.arrayBuffer());
+    await new Promise<void>((resolve, reject) => {
+      const partial = httpRequest(upload.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': encoded.headers.get('content-type')!,
+          'Content-Length': String(bytes.length),
+        },
+      });
+      partial.on('response', () =>
+        reject(new Error('An incomplete upload unexpectedly completed')),
+      );
+      partial.on('error', (error) =>
+        error.message === 'acceptance transfer interrupted'
+          ? resolve()
+          : reject(error),
+      );
+      partial.write(bytes.subarray(0, bytes.length - 16), () => {
+        partial.destroy(new Error('acceptance transfer interrupted'));
+      });
+    });
+    await action(arrived, token, 'DELIVERED', { uploadId }).expect(400);
+    const retry = (await createUpload().expect(200)).body;
+    expect(retry.uploadId).toBe(uploadId);
+    expect(retry.fields.key).toBe(upload.fields.key);
+    const retriedForm = new FormData();
+    for (const [key, value] of Object.entries(retry.fields))
+      retriedForm.append(key, value as string);
+    retriedForm.append(
+      'file',
+      new Blob([new Uint8Array(png)], { type: 'image/png' }),
+      'pod.png',
+    );
+    expect(
+      (await fetch(retry.url, { method: 'POST', body: retriedForm })).status,
+    ).toBe(204);
+    expect(
+      (await action(arrived, token, 'DELIVERED', { uploadId }).expect(200)).body
+        .status,
+    ).toBe('DELIVERED');
+    expect(
+      (
+        await database.dataSource.query(
+          'SELECT count(*)::int count FROM pod_uploads WHERE "deliveryId"=$1',
+          [arrived.id],
+        )
+      )[0].count,
+    ).toBe(1);
+    expect(
+      (
+        await database.dataSource.query(
+          'SELECT count(*)::int count FROM proofs_of_delivery WHERE "deliveryId"=$1',
+          [arrived.id],
+        )
+      )[0].count,
+    ).toBe(1);
+    expect(
+      await database.dataSource
+        .getRepository(LedgerEntry)
+        .countBy({ deliveryId: arrived.id }),
+    ).toBe(0);
   });
 });
