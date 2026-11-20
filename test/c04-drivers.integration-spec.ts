@@ -251,6 +251,35 @@ describe('C04 driver capability and availability through HTTP', () => {
       .expect(200);
   });
 
+  it('returns only current active platform roles for capability routing', async () => {
+    for (const [token, roles] of [
+      [adminToken, [AdminRole.ADMIN]],
+      [supportToken, [AdminRole.SUPPORT]],
+      [driverToken, []],
+    ] as const) {
+      const response = await request(app.getHttpServer())
+        .get('/users/me')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(response.body.adminRoles).toEqual(roles);
+    }
+    const assignments = dataSource.getRepository(AdminRoleAssignment);
+    await assignments.update({ userId: support.id }, { active: false });
+    try {
+      const response = await request(app.getHttpServer())
+        .get('/users/me')
+        .set('Authorization', `Bearer ${supportToken}`)
+        .expect(200);
+      expect(response.body.adminRoles).toEqual([]);
+      await request(app.getHttpServer())
+        .get('/drivers')
+        .set('Authorization', `Bearer ${supportToken}`)
+        .expect(403);
+    } finally {
+      await assignments.update({ userId: support.id }, { active: true });
+    }
+  });
+
   it('onboards an inactive driver and writes a safe audit record', async () => {
     const response = await request(app.getHttpServer())
       .post(`/users/${driverUser.id}/driver-profile`)
